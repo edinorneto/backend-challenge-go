@@ -278,14 +278,14 @@ func (s *Server) wageringHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, database.ErrIdempotencyConflict) || errors.Is(err, database.ErrExternalTransactionConflict) {
+			failureCode := "idempotency_conflict"
+			if errors.Is(err, database.ErrExternalTransactionConflict) {
+				failureCode = "external_transaction_conflict"
+			}
 			writeJSON(w, http.StatusConflict, map[string]any{
-				"transactionId": result.TransactionID,
-				"status":        "REJECTED",
-				"failureCode":   "idempotency_conflict",
-				"balance": map[string]string{
-					"amount":   result.Balance.String(),
-					"currency": result.Balance.Currency(),
-				},
+				"status":           "CONFLICT",
+				"failureCode":      failureCode,
+				"idempotentReplay": false,
 			})
 			return
 		}

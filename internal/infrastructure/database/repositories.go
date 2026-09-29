@@ -402,7 +402,7 @@ func (r *WalletRepo) ProcessTransaction(
 	defer tx.Rollback(ctx)
 
 	transactionID := uuid.New()
-	_, err = tx.Exec(
+	insertResult, err := tx.Exec(
 		ctx,
 		`
 		INSERT INTO wager_transactions (
@@ -451,13 +451,13 @@ func (r *WalletRepo) ProcessTransaction(
 			NULL,
 			NULL,
 			NULL,
-			NULL,
 			0,
 			NULL,
 			$14,
 			$14,
 			NULL
 		)
+		ON CONFLICT DO NOTHING
 		`,
 		transactionID,
 		req.ProviderID,
@@ -471,20 +471,21 @@ func (r *WalletRepo) ProcessTransaction(
 		req.Kind,
 		req.Amount.AmountCents(),
 		req.Amount.Currency(),
+		req.ReferenceExternalTransactionID,
 		now,
 	)
 	if err != nil {
-		if isUniqueViolation(err) {
-			result, dupErr := handleDuplicateTransaction(ctx, tx, req)
-			if dupErr != nil {
-				return ports.ProcessTransactionResult{}, dupErr
-			}
-			if err := tx.Commit(ctx); err != nil {
-				return ports.ProcessTransactionResult{}, fmt.Errorf("commit duplicate transaction: %w", err)
-			}
-			return result, nil
-		}
 		return ports.ProcessTransactionResult{}, fmt.Errorf("insert wager transaction: %w", err)
+	}
+	if insertResult.RowsAffected() == 0 {
+		result, duplicateErr := handleDuplicateTransaction(ctx, tx, req)
+		if duplicateErr != nil {
+			return ports.ProcessTransactionResult{}, duplicateErr
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("commit duplicate transaction: %w", err)
+		}
+		return result, nil
 	}
 
 	walletRow := struct {
