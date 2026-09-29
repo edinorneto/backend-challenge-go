@@ -24,15 +24,27 @@ var (
 	ErrWalletNotFound              = errors.New("wallet not found")
 	ErrIdempotencyConflict         = errors.New("idempotency conflict")
 	ErrExternalTransactionConflict = errors.New("external transaction conflict")
+	ErrReferenceNotFound           = errors.New("reference transaction not found")
+	ErrReferenceIncompatible       = errors.New("reference transaction incompatible")
+	ErrDuplicateReversal           = errors.New("duplicate reversal")
 )
 
 const (
-	failureInsufficientFunds      = "insufficient_funds"
-	failureCurrencyMismatch       = "currency_mismatch"
-	failureWalletPlayerMismatch   = "wallet_player_mismatch"
-	failureWalletCurrencyMismatch = "wallet_currency_mismatch"
-	failureUnsupportedOperation   = "unsupported_operation"
-	failureIdempotencyConflict    = "idempotency_conflict"
+	failureInsufficientFunds         = "insufficient_funds"
+	failureCurrencyMismatch          = "currency_mismatch"
+	failureWalletPlayerMismatch      = "wallet_player_mismatch"
+	failureWalletCurrencyMismatch    = "wallet_currency_mismatch"
+	failureUnsupportedOperation      = "unsupported_operation"
+	failureIdempotencyConflict       = "idempotency_conflict"
+	failureReferenceNotFound         = "reference_not_found"
+	failureReferencePending          = "reference_pending"
+	failureReferenceIncompatible     = "reference_incompatible"
+	failureReversalAlreadyProcessed  = "reversal_already_processed"
+	failureReversalInsufficientFunds = "reversal_insufficient_funds"
+)
+
+const (
+	maxReferenceAttempts = 5
 )
 
 type WalletRepo struct {
@@ -488,6 +500,28 @@ func (r *WalletRepo) ProcessTransaction(
 		return result, nil
 	}
 
+	reference, pending, err := resolveReversalReference(ctx, tx, req)
+	if err != nil {
+		return ports.ProcessTransactionResult{}, err
+	}
+	if pending {
+		var walletExists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM wallets WHERE id = $1)`, req.WalletID).Scan(&walletExists); err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("check wallet for pending reference: %w", err)
+		}
+		if !walletExists {
+			return ports.ProcessTransactionResult{}, ErrWalletNotFound
+		}
+		result, err := persistPendingReference(ctx, tx, transactionID, req, now)
+		if err != nil {
+			return ports.ProcessTransactionResult{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("commit pending reference: %w", err)
+		}
+		return result, nil
+	}
+
 	walletRow := struct {
 		playerID     uuid.UUID
 		currency     string
@@ -633,7 +667,52 @@ func (r *WalletRepo) ProcessTransaction(
 		}
 		resultBalance = w.Balance()
 		resultVersion = w.Version()
-	case "OPENING", "REFUND", "ROLLBACK":
+	case "REFUND", "ROLLBACK":
+		if err := validateReversalReference(req, reference); err != nil {
+			status = "REJECTED"
+			failureCode = failureCodeForReferenceError(err)
+			break
+		}
+		if err := validateNoDuplicateReversal(ctx, tx, req, reference); err != nil {
+			status = "REJECTED"
+			failureCode = failureCodeForReferenceError(err)
+			break
+		}
+		if req.Kind == "REFUND" && strings.TrimSpace(reference.kind) != "BET" {
+			status = "REJECTED"
+			failureCode = failureReferenceIncompatible
+			break
+		}
+		if req.Kind == "ROLLBACK" &&
+			strings.TrimSpace(reference.kind) != "BET" &&
+			strings.TrimSpace(reference.kind) != "WIN" &&
+			strings.TrimSpace(reference.kind) != "REFUND" {
+			status = "REJECTED"
+			failureCode = failureReferenceIncompatible
+			break
+		}
+		if req.Kind == "ROLLBACK" && strings.TrimSpace(reference.kind) != "BET" {
+			if err := w.Debit(req.Amount, now); err != nil {
+				if errors.Is(err, wallet.ErrInsufficientFunds) {
+					status = "REJECTED"
+					failureCode = failureReversalInsufficientFunds
+					break
+				}
+				return ports.ProcessTransactionResult{}, fmt.Errorf("apply ROLLBACK debit: %w", err)
+			}
+			ledgerEntry, err = ledger.NewDebit(uuid.New(), req.WalletID, transactionID, req.Amount, walletBalance, now)
+		} else {
+			if err := w.Credit(req.Amount, now); err != nil {
+				return ports.ProcessTransactionResult{}, fmt.Errorf("apply reversal credit: %w", err)
+			}
+			ledgerEntry, err = ledger.NewCredit(uuid.New(), req.WalletID, transactionID, req.Amount, walletBalance, now)
+		}
+		if err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("create reversal ledger entry: %w", err)
+		}
+		resultBalance = w.Balance()
+		resultVersion = w.Version()
+	case "OPENING":
 		status = "REJECTED"
 		failureCode = failureUnsupportedOperation
 	default:
@@ -642,7 +721,7 @@ func (r *WalletRepo) ProcessTransaction(
 	}
 
 	if status == "PROCESSED" {
-		if req.Kind == "BET" || req.Kind == "WIN" {
+		if ledgerEntry != nil {
 			if _, err := tx.Exec(
 				ctx,
 				`UPDATE wallets SET balance_cents = $1, version = $2, updated_at = $3 WHERE id = $4`,
@@ -692,12 +771,14 @@ func (r *WalletRepo) ProcessTransaction(
 			    failure_code = NULL,
 			    result_balance_cents = $1,
 			    result_wallet_version = $2,
-			    updated_at = $3,
-			    processed_at = $3
-			WHERE id = $4
+			        reference_transaction_id = COALESCE(reference_transaction_id, $3),
+			        updated_at = $4,
+			    processed_at = $4
+			WHERE id = $5
 			`,
 			resultBalance.AmountCents(),
 			resultVersion,
+			referenceTransactionIDOrNil(req.Kind, reference),
 			now,
 			transactionID,
 		)
@@ -708,8 +789,8 @@ func (r *WalletRepo) ProcessTransaction(
 		if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, "WagerTransactionProcessed", buildProcessedPayload(transactionID, req, resultBalance, resultVersion)); err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("insert processed outbox event: %w", err)
 		}
-		if req.Kind == "BET" || req.Kind == "WIN" {
-			if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, "WalletBalanceChanged", buildWalletBalanceChangedPayload(req.WalletID, transactionID, req.Kind, req.Amount, walletBalance, resultBalance, w.Version(), resultVersion)); err != nil {
+		if ledgerEntry != nil {
+			if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, "WalletBalanceChanged", buildWalletBalanceChangedPayload(req.WalletID, transactionID, string(ledgerEntry.Direction()), req.Amount, walletBalance, resultBalance, w.Version(), resultVersion)); err != nil {
 				return ports.ProcessTransactionResult{}, fmt.Errorf("insert wallet balance outbox event: %w", err)
 			}
 		}
@@ -753,6 +834,129 @@ func (r *WalletRepo) ProcessTransaction(
 	}, nil
 }
 
+// RetryPendingReference advances retry metadata for a pending reversal whose
+// reference is still unavailable. It does not touch the wallet or ledger.
+func (r *WalletRepo) RetryPendingReference(ctx context.Context, transactionID uuid.UUID) (ports.ProcessTransactionResult, error) {
+	tx, err := r.DB.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("begin reference retry: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var req struct {
+		providerID          string
+		externalID          string
+		idempotencyKey      string
+		payloadHash         string
+		playerID            uuid.UUID
+		walletID            uuid.UUID
+		roundID             string
+		gameID              string
+		kind                string
+		amountCents         int64
+		currency            string
+		referenceExternalID string
+		status              string
+		attempts            int
+		balanceCents        int64
+	}
+	err = tx.QueryRow(ctx, `
+		SELECT provider_id, external_transaction_id, idempotency_key, payload_hash,
+		       player_id, wallet_id, round_id, game_id, kind, amount_cents, currency,
+		       reference_external_transaction_id, status, reference_attempts,
+		       COALESCE(result_balance_cents, 0)
+		FROM wager_transactions
+		WHERE id = $1
+		FOR UPDATE
+	`, transactionID).Scan(
+		&req.providerID, &req.externalID, &req.idempotencyKey, &req.payloadHash,
+		&req.playerID, &req.walletID, &req.roundID, &req.gameID, &req.kind,
+		&req.amountCents, &req.currency, &req.referenceExternalID, &req.status,
+		&req.attempts, &req.balanceCents,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ports.ProcessTransactionResult{}, ErrReferenceNotFound
+	}
+	if err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("lock pending reference: %w", err)
+	}
+	if req.status != "PENDING_REFERENCE" {
+		balance, err := money.FromCents(req.balanceCents, req.currency)
+		if err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("rehydrate retry result: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("commit reference retry result: %w", err)
+		}
+		return ports.ProcessTransactionResult{TransactionID: transactionID, Status: req.status, Balance: balance}, nil
+	}
+
+	var referenceExists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM wager_transactions
+			WHERE provider_id = $1 AND external_transaction_id = $2
+		)
+	`, req.providerID, req.referenceExternalID).Scan(&referenceExists); err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("check reference retry: %w", err)
+	}
+	if referenceExists {
+		balance, err := money.FromCents(req.balanceCents, req.currency)
+		if err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("rehydrate pending balance: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("commit pending reference retry: %w", err)
+		}
+		return ports.ProcessTransactionResult{TransactionID: transactionID, Status: req.status, Balance: balance, FailureCode: failureReferencePending}, nil
+	}
+
+	now := time.Now().UTC()
+	attempts := req.attempts + 1
+	status := "PENDING_REFERENCE"
+	eventType := "WagerTransactionPendingReference"
+	if attempts > maxReferenceAttempts {
+		status = "REJECTED"
+		eventType = "WagerTransactionRejected"
+	}
+	nextAttempt := nextReferenceAttempt(now, attempts)
+	failureCode := failureReferencePending
+	if status == "REJECTED" {
+		failureCode = failureReferenceNotFound
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE wager_transactions
+		SET status = $1, failure_code = $2, reference_attempts = $3,
+		    reference_next_attempt_at = $4, updated_at = $5,
+		    processed_at = NULL
+		WHERE id = $6
+	`, status, failureCode, attempts, nextAttempt, now, transactionID); err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("update reference retry: %w", err)
+	}
+	payload := map[string]any{
+		"transactionId":                  transactionID,
+		"walletId":                       req.walletID,
+		"providerId":                     req.providerID,
+		"kind":                           req.kind,
+		"status":                         status,
+		"failureCode":                    failureCode,
+		"referenceExternalTransactionId": req.referenceExternalID,
+		"referenceAttempts":              attempts,
+		"nextAttemptAt":                  nextAttempt.UTC().Format(time.RFC3339),
+	}
+	if err := insertOutboxEvent(ctx, tx, now, transactionID, req.walletID, eventType, payload); err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("insert reference retry outbox event: %w", err)
+	}
+	balance, err := money.FromCents(req.balanceCents, req.currency)
+	if err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("rehydrate reference retry balance: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("commit reference retry: %w", err)
+	}
+	return ports.ProcessTransactionResult{TransactionID: transactionID, Status: status, Balance: balance, FailureCode: failureCode}, nil
+}
+
 func handleDuplicateTransaction(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -765,12 +969,13 @@ func handleDuplicateTransaction(
 		existingResultBalanceCents  int64
 		existingResultWalletVersion int64
 		existingCurrency            string
+		existingFailureCode         *string
 	)
 
 	err := tx.QueryRow(
 		ctx,
 		`
-		SELECT id, status, payload_hash, result_balance_cents, result_wallet_version, currency
+		SELECT id, status, payload_hash, result_balance_cents, result_wallet_version, currency, failure_code
 		FROM wager_transactions
 		WHERE provider_id = $1 AND idempotency_key = $2
 		LIMIT 1
@@ -784,6 +989,7 @@ func handleDuplicateTransaction(
 		&existingResultBalanceCents,
 		&existingResultWalletVersion,
 		&existingCurrency,
+		&existingFailureCode,
 	)
 	if err == nil {
 		if existingPayloadHash == req.PayloadHash {
@@ -796,6 +1002,7 @@ func handleDuplicateTransaction(
 				Status:           existingStatus,
 				Balance:          balance,
 				IdempotentReplay: true,
+				FailureCode:      stringValue(existingFailureCode),
 			}, nil
 		}
 		return ports.ProcessTransactionResult{}, ErrIdempotencyConflict
@@ -807,7 +1014,7 @@ func handleDuplicateTransaction(
 	err = tx.QueryRow(
 		ctx,
 		`
-		SELECT id, status, payload_hash, result_balance_cents, result_wallet_version, currency
+		SELECT id, status, payload_hash, result_balance_cents, result_wallet_version, currency, failure_code
 		FROM wager_transactions
 		WHERE provider_id = $1 AND external_transaction_id = $2
 		LIMIT 1
@@ -821,6 +1028,7 @@ func handleDuplicateTransaction(
 		&existingResultBalanceCents,
 		&existingResultWalletVersion,
 		&existingCurrency,
+		&existingFailureCode,
 	)
 	if err == nil {
 		return ports.ProcessTransactionResult{}, ErrExternalTransactionConflict
@@ -832,9 +1040,251 @@ func handleDuplicateTransaction(
 	return ports.ProcessTransactionResult{}, ErrIdempotencyConflict
 }
 
-func isUniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+type reversalReference struct {
+	id          uuid.UUID
+	providerID  string
+	externalID  string
+	playerID    uuid.UUID
+	walletID    uuid.UUID
+	roundID     string
+	kind        string
+	status      string
+	amountCents int64
+	currency    string
+}
+
+func resolveReversalReference(
+	ctx context.Context,
+	tx pgx.Tx,
+	req ports.ProcessTransactionRequest,
+) (*reversalReference, bool, error) {
+	if req.Kind != "REFUND" && req.Kind != "ROLLBACK" {
+		return nil, false, nil
+	}
+
+	var reference reversalReference
+	err := tx.QueryRow(
+		ctx,
+		`
+		SELECT id, provider_id, external_transaction_id, player_id, wallet_id,
+		       round_id, kind, status, amount_cents, currency
+		FROM wager_transactions
+		WHERE provider_id = $1
+		  AND external_transaction_id = $2
+		ORDER BY created_at ASC
+		LIMIT 1
+		FOR UPDATE
+		`,
+		req.ProviderID,
+		req.ReferenceExternalTransactionID,
+	).Scan(
+		&reference.id,
+		&reference.providerID,
+		&reference.externalID,
+		&reference.playerID,
+		&reference.walletID,
+		&reference.roundID,
+		&reference.kind,
+		&reference.status,
+		&reference.amountCents,
+		&reference.currency,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, true, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve reversal reference: %w", err)
+	}
+
+	if reference.status == "PENDING" || reference.status == "PENDING_REFERENCE" {
+		return &reference, true, nil
+	}
+	if reference.status != "PROCESSED" {
+		return &reference, false, nil
+	}
+
+	return &reference, false, nil
+}
+
+func persistPendingReference(
+	ctx context.Context,
+	tx pgx.Tx,
+	transactionID uuid.UUID,
+	req ports.ProcessTransactionRequest,
+	now time.Time,
+) (ports.ProcessTransactionResult, error) {
+	attempts := 1
+	nextAttempt := nextReferenceAttempt(now, attempts)
+	var status string
+	if attempts > maxReferenceAttempts {
+		status = "REJECTED"
+	} else {
+		status = "PENDING_REFERENCE"
+	}
+
+	failureCode := failureReferenceNotFound
+	eventType := "WagerTransactionPendingReference"
+	if req.ReferenceExternalTransactionID != "" {
+		failureCode = failureReferencePending
+	}
+	if status == "REJECTED" {
+		failureCode = failureReferenceNotFound
+		eventType = "WagerTransactionRejected"
+	}
+
+	zero, err := money.Zero(req.Amount.Currency())
+	if err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("create pending reference balance: %w", err)
+	}
+	_, err = tx.Exec(
+		ctx,
+		`
+		UPDATE wager_transactions
+		SET status = $1,
+		    failure_code = $2,
+		    reference_attempts = $3,
+		    reference_next_attempt_at = $4,
+		    result_balance_cents = $5,
+		    result_wallet_version = NULL,
+		    updated_at = $6
+		WHERE id = $7
+		`,
+		status,
+		failureCode,
+		attempts,
+		nextAttempt,
+		zero.AmountCents(),
+		now,
+		transactionID,
+	)
+	if err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("persist pending reference: %w", err)
+	}
+
+	payload := map[string]any{
+		"transactionId":                  transactionID,
+		"walletId":                       req.WalletID,
+		"providerId":                     req.ProviderID,
+		"kind":                           req.Kind,
+		"status":                         status,
+		"failureCode":                    failureCode,
+		"referenceExternalTransactionId": req.ReferenceExternalTransactionID,
+		"referenceAttempts":              attempts,
+		"nextAttemptAt":                  nextAttempt.UTC().Format(time.RFC3339),
+	}
+	if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, eventType, payload); err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("insert pending reference outbox event: %w", err)
+	}
+
+	return ports.ProcessTransactionResult{
+		TransactionID: transactionID,
+		Status:        status,
+		Balance:       zero,
+		FailureCode:   failureCode,
+	}, nil
+}
+
+func nextReferenceAttempt(now time.Time, attempts int) time.Time {
+	if attempts < 1 {
+		attempts = 1
+	}
+	return now.Add(time.Minute << (attempts - 1))
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func validateReversalReference(
+	req ports.ProcessTransactionRequest,
+	reference *reversalReference,
+) error {
+	if reference == nil {
+		return ErrReferenceNotFound
+	}
+	if strings.TrimSpace(reference.status) != "PROCESSED" {
+		return ErrReferenceIncompatible
+	}
+	if strings.TrimSpace(reference.providerID) != strings.TrimSpace(req.ProviderID) ||
+		reference.playerID != req.PlayerID ||
+		reference.walletID != req.WalletID ||
+		strings.TrimSpace(reference.roundID) != strings.TrimSpace(req.RoundID) ||
+		strings.TrimSpace(reference.currency) != strings.TrimSpace(req.Amount.Currency()) ||
+		reference.amountCents != req.Amount.AmountCents() {
+		return ErrReferenceIncompatible
+	}
+	return nil
+}
+
+func validateNoDuplicateReversal(
+	ctx context.Context,
+	tx pgx.Tx,
+	req ports.ProcessTransactionRequest,
+	reference *reversalReference,
+) error {
+	if reference == nil {
+		return ErrReferenceNotFound
+	}
+
+	query := `
+		SELECT EXISTS (
+			SELECT 1
+			FROM wager_transactions
+			WHERE provider_id = $1
+			  AND reference_external_transaction_id = $2
+			  AND status = 'PROCESSED'
+			  AND kind = $3
+		)`
+	kind := req.Kind
+	if reference.kind == "BET" {
+		query = `
+			SELECT EXISTS (
+				SELECT 1
+				FROM wager_transactions
+				WHERE provider_id = $1
+				  AND reference_external_transaction_id = $2
+				  AND status = 'PROCESSED'
+				  AND kind IN ('REFUND', 'ROLLBACK')
+			)`
+	}
+
+	var exists bool
+	var err error
+	if reference.kind == "BET" {
+		err = tx.QueryRow(ctx, query, req.ProviderID, req.ReferenceExternalTransactionID).Scan(&exists)
+	} else {
+		err = tx.QueryRow(ctx, query, req.ProviderID, req.ReferenceExternalTransactionID, kind).Scan(&exists)
+	}
+	if err != nil {
+		return fmt.Errorf("check duplicate reversal: %w", err)
+	}
+	if exists {
+		return ErrDuplicateReversal
+	}
+	return nil
+}
+
+func failureCodeForReferenceError(err error) string {
+	switch {
+	case errors.Is(err, ErrReferenceNotFound):
+		return failureReferenceNotFound
+	case errors.Is(err, ErrDuplicateReversal):
+		return failureReversalAlreadyProcessed
+	case errors.Is(err, ErrReferenceIncompatible):
+		return failureReferenceIncompatible
+	default:
+		return failureReferenceIncompatible
+	}
+}
+
+func referenceTransactionIDOrNil(kind string, reference *reversalReference) *uuid.UUID {
+	if (kind != "REFUND" && kind != "ROLLBACK") || reference == nil {
+		return nil
+	}
+	return &reference.id
 }
 
 func insertOutboxEvent(
@@ -921,7 +1371,7 @@ func buildProcessedPayload(
 func buildWalletBalanceChangedPayload(
 	walletID uuid.UUID,
 	transactionID uuid.UUID,
-	kind string,
+	direction string,
 	amount money.Money,
 	balanceBefore money.Money,
 	balanceAfter money.Money,
@@ -931,7 +1381,7 @@ func buildWalletBalanceChangedPayload(
 	return map[string]any{
 		"walletId":      walletID,
 		"transactionId": transactionID,
-		"direction":     mapDirection(kind),
+		"direction":     direction,
 		"money": map[string]string{
 			"amount":   amount.String(),
 			"currency": amount.Currency(),
@@ -974,16 +1424,5 @@ func buildRejectedPayload(
 			},
 			"version": version,
 		},
-	}
-}
-
-func mapDirection(kind string) string {
-	switch strings.ToUpper(kind) {
-	case "BET":
-		return "DEBIT"
-	case "WIN":
-		return "CREDIT"
-	default:
-		return ""
 	}
 }

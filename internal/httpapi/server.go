@@ -312,6 +312,11 @@ func (s *Server) wageringHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusUnprocessableEntity, response)
 			return
 		}
+		if result.Status == "PENDING_REFERENCE" {
+			delete(response, "balance")
+			writeJSON(w, http.StatusAccepted, response)
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, response)

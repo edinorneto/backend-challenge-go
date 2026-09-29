@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS uq_wager_processed_reversal_reference_kind;

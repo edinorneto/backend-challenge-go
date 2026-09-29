@@ -10,7 +10,7 @@ import (
 	"go.uber.org/fx"
 )
 
-//go:embed sql/000001_init.up.sql
+//go:embed sql/*.sql
 var migrationFS embed.FS
 
 type Runner struct {
@@ -48,54 +48,64 @@ func (r *Runner) Up(ctx context.Context) error {
 		return fmt.Errorf("create schema_migrations table: %w", err)
 	}
 
-	const version int64 = 1
+	for version := int64(1); version <= 2; version++ {
+		var applied bool
+		err = r.pool.QueryRow(
+			migrationCtx,
+			`SELECT EXISTS (
+				SELECT 1
+				FROM schema_migrations
+				WHERE version = $1
+			)`,
+			version,
+		).Scan(&applied)
+		if err != nil {
+			return fmt.Errorf("check migration version %d: %w", version, err)
+		}
+		if applied {
+			continue
+		}
 
-	var applied bool
+		filename := fmt.Sprintf("%06d_", version)
+		entries, err := migrationFS.ReadDir("sql")
+		if err != nil {
+			return fmt.Errorf("list migration files: %w", err)
+		}
+		var migrationFile string
+		for _, entry := range entries {
+			if len(entry.Name()) >= len(filename) && entry.Name()[:len(filename)] == filename && len(entry.Name()) > len(".up.sql") && entry.Name()[len(entry.Name())-len(".up.sql"):] == ".up.sql" {
+				migrationFile = entry.Name()
+				break
+			}
+		}
+		if migrationFile == "" {
+			return fmt.Errorf("migration file not found for version %d", version)
+		}
 
-	err = r.pool.QueryRow(
-		migrationCtx,
-		`SELECT EXISTS (
-			SELECT 1
-			FROM schema_migrations
-			WHERE version = $1
-		)`,
-		version,
-	).Scan(&applied)
-	if err != nil {
-		return fmt.Errorf("check migration version: %w", err)
-	}
+		sqlBytes, err := migrationFS.ReadFile("sql/" + migrationFile)
+		if err != nil {
+			return fmt.Errorf("read migration file %s: %w", migrationFile, err)
+		}
 
-	if applied {
-		return nil
-	}
-
-	sqlBytes, err := migrationFS.ReadFile("sql/000001_init.up.sql")
-	if err != nil {
-		return fmt.Errorf("read migration file: %w", err)
-	}
-
-	tx, err := r.pool.Begin(migrationCtx)
-	if err != nil {
-		return fmt.Errorf("begin migration transaction: %w", err)
-	}
-
-	defer tx.Rollback(migrationCtx)
-
-	if _, err := tx.Exec(migrationCtx, string(sqlBytes)); err != nil {
-		return fmt.Errorf("execute migration: %w", err)
-	}
-
-	if _, err := tx.Exec(
-		migrationCtx,
-		`INSERT INTO schema_migrations (version)
-		 VALUES ($1)`,
-		version,
-	); err != nil {
-		return fmt.Errorf("register migration: %w", err)
-	}
-
-	if err := tx.Commit(migrationCtx); err != nil {
-		return fmt.Errorf("commit migration: %w", err)
+		tx, err := r.pool.Begin(migrationCtx)
+		if err != nil {
+			return fmt.Errorf("begin migration %d transaction: %w", version, err)
+		}
+		if _, err := tx.Exec(migrationCtx, string(sqlBytes)); err != nil {
+			_ = tx.Rollback(migrationCtx)
+			return fmt.Errorf("execute migration %d: %w", version, err)
+		}
+		if _, err := tx.Exec(
+			migrationCtx,
+			`INSERT INTO schema_migrations (version) VALUES ($1)`,
+			version,
+		); err != nil {
+			_ = tx.Rollback(migrationCtx)
+			return fmt.Errorf("register migration %d: %w", version, err)
+		}
+		if err := tx.Commit(migrationCtx); err != nil {
+			return fmt.Errorf("commit migration %d: %w", version, err)
+		}
 	}
 
 	return nil

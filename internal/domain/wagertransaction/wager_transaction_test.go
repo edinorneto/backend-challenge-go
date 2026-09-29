@@ -171,3 +171,69 @@ func TestRefundRequiresReference(t *testing.T) {
 		)
 	}
 }
+
+func TestPendingReferenceCanResolveAndProcess(t *testing.T) {
+	amount, err := money.ParseExternal("25.00", "BRL")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := NewExternal(
+		uuid.New(),
+		"provider-a",
+		"refund-456",
+		"provider-a:refund-456",
+		"hash",
+		uuid.New(),
+		uuid.New(),
+		"round-1",
+		"game-1",
+		KindRefund,
+		amount,
+		time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.SetReference("bet-456"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.MarkPendingReference(time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	referenceID := uuid.New()
+	if err := tx.AssociateReference(referenceID); err != nil {
+		t.Fatal(err)
+	}
+
+	balance, err := money.ParseExternal("125.00", "BRL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.MarkProcessed(balance, 2, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if tx.ReferenceTransactionID() != referenceID {
+		t.Fatalf("expected reference %s, got %s", referenceID, tx.ReferenceTransactionID())
+	}
+}
+
+func TestTerminalTransactionCannotAssociateReference(t *testing.T) {
+	amount, err := money.ParseExternal("25.00", "BRL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := NewExternal(
+		uuid.New(), "provider-a", "refund-789", "key", "hash",
+		uuid.New(), uuid.New(), "round-1", "game-1", KindRefund, amount, time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.MarkProcessed(amount, 1, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.AssociateReference(uuid.New()); err != ErrTerminalTransaction {
+		t.Fatalf("expected terminal error, got %v", err)
+	}
+}

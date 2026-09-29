@@ -66,6 +66,10 @@ func (s *WageringService) ProcessTransaction(
 	if kind == "" {
 		return ports.ProcessTransactionResult{}, ErrInvalidWagerRequest
 	}
+	if (kind == "REFUND" || kind == "ROLLBACK") &&
+		strings.TrimSpace(req.ReferenceExternalTransactionID) == "" {
+		return ports.ProcessTransactionResult{}, ErrInvalidWagerRequest
+	}
 
 	payloadHash, err := computePayloadHash(
 		req.ProviderID,

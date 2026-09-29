@@ -189,6 +189,21 @@ func (t *WagerTransaction) SetReference(
 	return nil
 }
 
+func (t *WagerTransaction) AssociateReference(transactionID uuid.UUID) error {
+	if t.isTerminal() {
+		return ErrTerminalTransaction
+	}
+	if t.kind != KindRefund && t.kind != KindRollback {
+		return ErrInvalidReference
+	}
+	if transactionID == uuid.Nil {
+		return ErrInvalidReference
+	}
+
+	t.referenceTransactionID = transactionID
+	return nil
+}
+
 func (t *WagerTransaction) MarkPendingReference(now time.Time) error {
 	if err := t.canTransitionTo(StatusPendingReference); err != nil {
 		return err
@@ -368,7 +383,7 @@ func (t *WagerTransaction) canTransitionTo(target Status) error {
 
 	case StatusPendingReference:
 		switch target {
-		case StatusProcessed, StatusRejected, StatusFailed:
+		case StatusPendingReference, StatusProcessed, StatusRejected, StatusFailed:
 			return nil
 		}
 	}
