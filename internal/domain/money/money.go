@@ -1,6 +1,7 @@
 package money
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -115,6 +116,14 @@ func (m Money) Equal(other Money) bool {
 		m.amountCents == other.amountCents
 }
 
+func (m Money) LessThan(other Money) (bool, error) {
+	if err := m.ensureSameCurrency(other); err != nil {
+		return false, err
+	}
+
+	return m.amountCents < other.amountCents, nil
+}
+
 func (m Money) GreaterThan(other Money) (bool, error) {
 	if err := m.ensureSameCurrency(other); err != nil {
 		return false, err
@@ -159,22 +168,47 @@ func (m Money) Subtract(other Money) (Money, error) {
 	})
 }
 
+func (m Money) Negate() (Money, error) {
+	if m.amountCents == math.MinInt64 {
+		return Money{}, ErrOverflow
+	}
+
+	return Money{
+		amountCents: -m.amountCents,
+		currency:    m.currency,
+	}, nil
+}
+
 func (m Money) String() string {
 	sign := ""
+	var absolute uint64
 
-	cents := m.amountCents
-
-	if cents < 0 {
+	if m.amountCents < 0 {
 		sign = "-"
-		cents = -cents
+		absolute = uint64(-(m.amountCents + 1)) + 1
+	} else {
+		absolute = uint64(m.amountCents)
 	}
+
+	integerPart := absolute / 100
+	decimalPart := absolute % 100
 
 	return fmt.Sprintf(
 		"%s%d.%02d",
 		sign,
-		cents/100,
-		cents%100,
+		integerPart,
+		decimalPart,
 	)
+}
+
+func (m Money) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Amount   string `json:"amount"`
+		Currency string `json:"currency"`
+	}{
+		Amount:   m.String(),
+		Currency: m.currency,
+	})
 }
 
 func (m Money) ensureSameCurrency(other Money) error {

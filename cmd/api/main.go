@@ -26,8 +26,12 @@ func main() {
 			func(repo *database.WalletRepo) ports.WalletRepository {
 				return repo
 			},
+			func(repo *database.WalletRepo) ports.WageringRepository {
+				return repo
+			},
 
 			application.NewWalletService,
+			application.NewWageringService,
 			httpapi.NewServer,
 		),
 

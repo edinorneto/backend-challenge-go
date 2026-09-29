@@ -15,12 +15,19 @@ import (
 )
 
 type Server struct {
-	wallets *application.WalletService
+	wallets  *application.WalletService
+	wagering *application.WageringService
 }
 
-func NewServer(wallets *application.WalletService) *Server {
+func NewServer(wallets *application.WalletService, wagering ...*application.WageringService) *Server {
+	var service *application.WageringService
+	if len(wagering) > 0 {
+		service = wagering[0]
+	}
+
 	return &Server{
-		wallets: wallets,
+		wallets:  wallets,
+		wagering: service,
 	}
 }
 
@@ -30,6 +37,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health/live", s.liveHandler)
 	mux.HandleFunc("POST /wallets", s.walletsHandler)
 	mux.HandleFunc("GET /wallets/{walletID}", s.getWalletHandler)
+	mux.HandleFunc("POST /wagering/transactions", s.wageringHandler)
 
 	return loggingMiddleware(mux)
 }
@@ -174,4 +182,137 @@ func (s *Server) getWalletHandler(w http.ResponseWriter, r *http.Request) {
 		},
 		"version": wallet.Version(),
 	})
+}
+
+func (s *Server) wageringHandler(w http.ResponseWriter, r *http.Request) {
+	if s.wagering == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": "wagering_service_unavailable",
+		})
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ProviderID            string `json:"providerId"`
+		ExternalTransactionID string `json:"externalTransactionId"`
+		PlayerID              string `json:"playerId"`
+		WalletID              string `json:"walletId"`
+		RoundID               string `json:"roundId"`
+		GameID                string `json:"gameId"`
+		Kind                  string `json:"kind"`
+		Money                 struct {
+			Amount   string `json:"amount"`
+			Currency string `json:"currency"`
+		} `json:"money"`
+		ReferenceExternalTransactionID string `json:"referenceExternalTransactionId"`
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid_json",
+		})
+		return
+	}
+
+	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempotencyKey == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "idempotency_key_required",
+		})
+		return
+	}
+
+	playerID, err := uuid.Parse(req.PlayerID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid_player_id",
+		})
+		return
+	}
+
+	walletID, err := uuid.Parse(req.WalletID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid_wallet_id",
+		})
+		return
+	}
+
+	amount, err := money.ParseExternal(req.Money.Amount, req.Money.Currency)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid_money",
+		})
+		return
+	}
+
+	result, err := s.wagering.ProcessTransaction(r.Context(), idempotencyKey, application.WageringRequest{
+		ProviderID:                     req.ProviderID,
+		ExternalTransactionID:          req.ExternalTransactionID,
+		PlayerID:                       playerID,
+		WalletID:                       walletID,
+		RoundID:                        req.RoundID,
+		GameID:                         req.GameID,
+		Kind:                           req.Kind,
+		Amount:                         amount,
+		ReferenceExternalTransactionID: req.ReferenceExternalTransactionID,
+	})
+	if err != nil {
+		if errors.Is(err, application.ErrIdempotencyKeyRequired) || errors.Is(err, application.ErrInvalidWagerRequest) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "invalid_request",
+			})
+			return
+		}
+		if errors.Is(err, database.ErrWalletNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{
+				"error": "wallet_not_found",
+			})
+			return
+		}
+		if errors.Is(err, database.ErrIdempotencyConflict) || errors.Is(err, database.ErrExternalTransactionConflict) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"transactionId": result.TransactionID,
+				"status":        "REJECTED",
+				"failureCode":   "idempotency_conflict",
+				"balance": map[string]string{
+					"amount":   result.Balance.String(),
+					"currency": result.Balance.Currency(),
+				},
+			})
+			return
+		}
+
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "internal_error",
+		})
+		return
+	}
+
+	response := map[string]any{
+		"transactionId": result.TransactionID,
+		"status":        result.Status,
+		"balance": map[string]string{
+			"amount":   result.Balance.String(),
+			"currency": result.Balance.Currency(),
+		},
+		"idempotentReplay": result.IdempotentReplay,
+	}
+
+	if result.FailureCode != "" {
+		response["failureCode"] = result.FailureCode
+		if result.Status == "REJECTED" {
+			writeJSON(w, http.StatusUnprocessableEntity, response)
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
