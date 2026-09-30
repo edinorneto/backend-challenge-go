@@ -26,6 +26,13 @@ func (s *stubWageringRepo) ProcessTransaction(
 	}, nil
 }
 
+func (s *stubWageringRepo) RetryPendingReference(
+	ctx context.Context,
+	transactionID uuid.UUID,
+) (ports.ProcessTransactionResult, error) {
+	return ports.ProcessTransactionResult{}, nil
+}
+
 func TestWageringPayloadHashIsDeterministic(t *testing.T) {
 	amount, err := money.ParseExternal("25.00", "BRL")
 	if err != nil {

@@ -41,4 +41,8 @@ type WageringRepository interface {
 		ctx context.Context,
 		req ProcessTransactionRequest,
 	) (ProcessTransactionResult, error)
+	RetryPendingReference(
+		ctx context.Context,
+		transactionID uuid.UUID,
+	) (ProcessTransactionResult, error)
 }

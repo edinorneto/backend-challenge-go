@@ -49,6 +49,82 @@ func TestProcessTransactionIdempotencyWithPostgres(t *testing.T) {
 	}
 }
 
+func TestProcessTransactionPendingReferenceReplay(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+	amount := testMoney(t, "25.00")
+
+	request := testRequest(playerID, walletID, "pending-replay", "pending-replay-key", "pending-replay-hash", amount)
+	request.Kind = "REFUND"
+	request.ReferenceExternalTransactionID = "missing-pending-replay-reference"
+
+	first, err := repo.ProcessTransaction(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != "PENDING_REFERENCE" {
+		t.Fatalf("expected first request to be pending, got %s", first.Status)
+	}
+	if first.FailureCode != "reference_pending" {
+		t.Fatalf("expected reference_pending failure code, got %s", first.FailureCode)
+	}
+
+	replay, err := repo.ProcessTransaction(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.TransactionID != first.TransactionID {
+		t.Fatalf("expected original transaction ID %s, got %s", first.TransactionID, replay.TransactionID)
+	}
+	if replay.Status != "PENDING_REFERENCE" {
+		t.Fatalf("expected pending replay, got %s", replay.Status)
+	}
+	if !replay.IdempotentReplay {
+		t.Fatal("expected idempotent replay")
+	}
+	if replay.FailureCode != first.FailureCode {
+		t.Fatalf("expected persisted failure code %q, got %q", first.FailureCode, replay.FailureCode)
+	}
+
+	var transactionCount int
+	if err := pool.QueryRow(
+		context.Background(),
+		`SELECT COUNT(*) FROM wager_transactions WHERE provider_id = $1 AND idempotency_key = $2`,
+		request.ProviderID,
+		request.IdempotencyKey,
+	).Scan(&transactionCount); err != nil {
+		t.Fatal(err)
+	}
+	if transactionCount != 1 {
+		t.Fatalf("expected one wager transaction, got %d", transactionCount)
+	}
+
+	var ledgerCount int
+	if err := pool.QueryRow(
+		context.Background(),
+		`SELECT COUNT(*) FROM wallet_ledger_entries WHERE wallet_id = $1`,
+		walletID,
+	).Scan(&ledgerCount); err != nil {
+		t.Fatal(err)
+	}
+	if ledgerCount != 1 {
+		t.Fatalf("expected only the opening ledger entry, got %d", ledgerCount)
+	}
+
+	var balanceCents int64
+	if err := pool.QueryRow(
+		context.Background(),
+		`SELECT balance_cents FROM wallets WHERE id = $1`,
+		walletID,
+	).Scan(&balanceCents); err != nil {
+		t.Fatal(err)
+	}
+	if balanceCents != 10000 {
+		t.Fatalf("expected wallet balance to remain 100.00, got %d cents", balanceCents)
+	}
+}
+
 func TestProcessTransactionRejectsIdempotencyPayloadConflict(t *testing.T) {
 	pool := testPool(t)
 	repo := database.NewWalletRepo(pool)
@@ -244,10 +320,10 @@ func TestProcessTransactionPendingReferencePersistsRetryState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if result.Status != "PENDING_REFERENCE" {
 		t.Fatalf("expected PENDING_REFERENCE, got %s", result.Status)
 	}
-
 	var attempts int
 	var nextAttempt time.Time
 	var eventType string
@@ -265,6 +341,187 @@ func TestProcessTransactionPendingReferencePersistsRetryState(t *testing.T) {
 	}
 }
 
+func TestRetryPendingReferenceProcessesExistingBet(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+	amount := testMoney(t, "25.00")
+
+	refund := testRequest(playerID, walletID, "retry-refund", "retry-refund-key", "retry-refund-hash", amount)
+	refund.Kind = "REFUND"
+	refund.ReferenceExternalTransactionID = "retry-bet"
+	pending, err := repo.ProcessTransaction(context.Background(), refund)
+	if err != nil || pending.Status != "PENDING_REFERENCE" {
+		t.Fatalf("expected pending refund, got %+v/%v", pending, err)
+	}
+
+	bet := testRequest(playerID, walletID, "retry-bet", "retry-bet-key", "retry-bet-hash", amount)
+	if result, err := repo.ProcessTransaction(context.Background(), bet); err != nil || result.Status != "PROCESSED" {
+		t.Fatalf("expected processed reference bet, got %+v/%v", result, err)
+	}
+
+	result, err := repo.RetryPendingReference(context.Background(), pending.TransactionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "PROCESSED" || result.Balance.String() != "100.00" {
+		t.Fatalf("expected processed retry with 100.00, got %+v", result)
+	}
+
+	var referenceID *uuid.UUID
+	var resultBalance int64
+	var resultVersion int64
+	if err := pool.QueryRow(context.Background(), `
+			SELECT reference_transaction_id, result_balance_cents, result_wallet_version
+			FROM wager_transactions WHERE id = $1
+		`, pending.TransactionID).Scan(&referenceID, &resultBalance, &resultVersion); err != nil {
+		t.Fatal(err)
+	}
+	var betID uuid.UUID
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM wager_transactions WHERE external_transaction_id = 'retry-bet' AND provider_id = $1`, refund.ProviderID).Scan(&betID); err != nil {
+		t.Fatal(err)
+	}
+	if referenceID == nil || *referenceID != betID || resultBalance != 10000 || resultVersion < 1 {
+		t.Fatalf("retry reference state invalid: reference=%v balance=%d version=%d", referenceID, resultBalance, resultVersion)
+	}
+	var direction string
+	if err := pool.QueryRow(context.Background(), `
+			SELECT direction FROM wallet_ledger_entries WHERE transaction_id = $1
+		`, pending.TransactionID).Scan(&direction); err != nil {
+		t.Fatal(err)
+	}
+	if direction != "CREDIT" {
+		t.Fatalf("expected refund credit ledger, got %s", direction)
+	}
+	var eventCount int
+	if err := pool.QueryRow(context.Background(), `
+			SELECT COUNT(*) FROM outbox_events
+			WHERE correlation_id = $1 AND event_type IN ('WagerTransactionProcessed', 'WalletBalanceChanged')
+		`, pending.TransactionID).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 2 {
+		t.Fatalf("expected two processed retry events, got %d", eventCount)
+	}
+}
+
+func TestRetryPendingReferenceProcessesRollbackWin(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+	amount := testMoney(t, "25.00")
+
+	rollback := testRequest(playerID, walletID, "retry-rollback", "retry-rollback-key", "retry-rollback-hash", amount)
+	rollback.Kind = "ROLLBACK"
+	rollback.ReferenceExternalTransactionID = "retry-win"
+	pending, err := repo.ProcessTransaction(context.Background(), rollback)
+	if err != nil || pending.Status != "PENDING_REFERENCE" {
+		t.Fatalf("expected pending rollback, got %+v/%v", pending, err)
+	}
+	win := testRequest(playerID, walletID, "retry-win", "retry-win-key", "retry-win-hash", amount)
+	win.Kind = "WIN"
+	if result, err := repo.ProcessTransaction(context.Background(), win); err != nil || result.Status != "PROCESSED" {
+		t.Fatalf("expected processed reference win, got %+v/%v", result, err)
+	}
+
+	result, err := repo.RetryPendingReference(context.Background(), pending.TransactionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "PROCESSED" || result.Balance.String() != "100.00" {
+		t.Fatalf("expected processed rollback retry with 100.00, got %+v", result)
+	}
+	var direction string
+	var payload []byte
+	if err := pool.QueryRow(context.Background(), `
+			SELECT l.direction, o.payload
+			FROM wallet_ledger_entries l
+			JOIN outbox_events o ON o.correlation_id = l.transaction_id
+			WHERE l.transaction_id = $1 AND o.event_type = 'WalletBalanceChanged'
+		`, pending.TransactionID).Scan(&direction, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if direction != "DEBIT" || !strings.Contains(string(payload), `"direction": "DEBIT"`) {
+		t.Fatalf("expected retry rollback debit direction, got %s/%s", direction, payload)
+	}
+}
+
+func TestRetryPendingReferenceDoesNotDuplicateProcessedReversal(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+	amount := testMoney(t, "25.00")
+	bet := testRequest(playerID, walletID, "retry-duplicate-bet", "retry-duplicate-bet-key", "retry-duplicate-bet-hash", amount)
+	if _, err := repo.ProcessTransaction(context.Background(), bet); err != nil {
+		t.Fatal(err)
+	}
+	refund := testRequest(playerID, walletID, "retry-duplicate-refund", "retry-duplicate-refund-key", "retry-duplicate-refund-hash", amount)
+	refund.Kind = "REFUND"
+	refund.ReferenceExternalTransactionID = bet.ExternalTransactionID
+	processedRefund, err := repo.ProcessTransaction(context.Background(), refund)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repo.RetryPendingReference(context.Background(), processedRefund.TransactionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var balanceCents, ledgerCount int
+	if err := pool.QueryRow(context.Background(), `SELECT balance_cents FROM wallets WHERE id = $1`, walletID).Scan(&balanceCents); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM wallet_ledger_entries WHERE transaction_id = $1`, processedRefund.TransactionID).Scan(&ledgerCount); err != nil {
+		t.Fatal(err)
+	}
+	if balanceCents != 10000 || ledgerCount != 1 {
+		t.Fatalf("retry of terminal reversal changed state: balance=%d ledger=%d", balanceCents, ledgerCount)
+	}
+}
+
+func TestRetryPendingReferenceIncrementsWhenReferenceStillPending(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+	amount := testMoney(t, "25.00")
+	first := testRequest(playerID, walletID, "still-pending-reference", "still-pending-reference-key", "still-pending-reference-hash", amount)
+	first.Kind = "REFUND"
+	first.ReferenceExternalTransactionID = "missing-underlying"
+	pendingReference, err := repo.ProcessTransaction(context.Background(), first)
+	if err != nil || pendingReference.Status != "PENDING_REFERENCE" {
+		t.Fatalf("expected pending reference, got %+v/%v", pendingReference, err)
+	}
+	second := testRequest(playerID, walletID, "retry-against-pending", "retry-against-pending-key", "retry-against-pending-hash", amount)
+	second.Kind = "REFUND"
+	second.ReferenceExternalTransactionID = first.ExternalTransactionID
+	pending, err := repo.ProcessTransaction(context.Background(), second)
+	if err != nil || pending.Status != "PENDING_REFERENCE" {
+		t.Fatalf("expected pending second reversal, got %+v/%v", pending, err)
+	}
+	result, err := repo.RetryPendingReference(context.Background(), pending.TransactionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "PENDING_REFERENCE" {
+		t.Fatalf("expected retry to remain pending, got %s", result.Status)
+	}
+	var attempts int
+	if err := pool.QueryRow(context.Background(), `SELECT reference_attempts FROM wager_transactions WHERE id = $1`, pending.TransactionID).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected attempts to increment to 2, got %d", attempts)
+	}
+	var balanceCents, ledgerCount int
+	if err := pool.QueryRow(context.Background(), `SELECT balance_cents FROM wallets WHERE id = $1`, walletID).Scan(&balanceCents); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM wallet_ledger_entries WHERE transaction_id = $1`, pending.TransactionID).Scan(&ledgerCount); err != nil {
+		t.Fatal(err)
+	}
+	if balanceCents != 10000 || ledgerCount != 0 {
+		t.Fatalf("pending reference retry changed financial state: balance=%d ledger=%d", balanceCents, ledgerCount)
+	}
+}
 func TestRetryPendingReferenceUsesExponentialBackoffAndRejectsAfterLimit(t *testing.T) {
 	pool := testPool(t)
 	repo := database.NewWalletRepo(pool)
