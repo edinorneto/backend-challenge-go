@@ -10,6 +10,7 @@ import (
 	"github.com/edinorneto/backend-challenge-go/internal/httpapi"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database/migrations"
+	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/sqs"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 
 	"go.uber.org/fx"
@@ -21,6 +22,8 @@ func main() {
 			config.Load,
 			database.NewPool,
 			migrations.NewRunner,
+			sqs.NewClient,
+			sqs.NewQueueManager,
 
 			database.NewWalletRepo,
 			func(repo *database.WalletRepo) ports.WalletRepository {
@@ -37,9 +40,18 @@ func main() {
 
 		fx.Invoke(
 			func(_ *migrations.Runner) {},
+			checkSQS,
 			runHTTP,
 		),
 	).Run()
+}
+
+func checkSQS(lc fx.Lifecycle, manager *sqs.QueueManager) {
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) error {
+			return manager.Check(ctx)
+		},
+	})
 }
 
 func runHTTP(

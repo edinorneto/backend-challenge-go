@@ -10,6 +10,51 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d betting"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
+  localstack:
+    image: localstack/localstack:3.8
+    container_name: backend_challenge_localstack
+    environment:
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      SQS_TRANSACTION_QUEUE: ${SQS_TRANSACTION_QUEUE:-wager-transactions.fifo}
+      SQS_TRANSACTION_DLQ: ${SQS_TRANSACTION_DLQ:-wager-transactions-dlq.fifo}
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+      SERVICES: sqs
+    ports:
+      - "4566:4566"
+    volumes:
+      - "./localstack/init/ready.d:/etc/localstack/init/ready.d"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health | grep -q sqs"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  application:
+    build:
+      context: .
+    container_name: backend_challenge_application
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/betting?sslmode=disable
+      HTTP_ADDR: :8080
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ENDPOINT: http://localstack:4566
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      SQS_TRANSACTION_QUEUE: ${SQS_TRANSACTION_QUEUE:-wager-transactions.fifo}
+      SQS_TRANSACTION_DLQ: ${SQS_TRANSACTION_DLQ:-wager-transactions-dlq.fifo}
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
 volumes:
   postgres_data:
