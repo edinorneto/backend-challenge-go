@@ -10,6 +10,7 @@ import (
 type QueueURLs struct {
 	Transaction    string
 	TransactionDLQ string
+	EventQueue     string
 }
 
 type QueueManager struct {
@@ -30,7 +31,11 @@ func (m *QueueManager) Resolve(ctx context.Context) (QueueURLs, error) {
 	if err != nil {
 		return QueueURLs{}, err
 	}
-	return QueueURLs{Transaction: transaction, TransactionDLQ: dlq}, nil
+	eventQueue, err := m.queueURL(ctx, m.config.EventQueue)
+	if err != nil {
+		return QueueURLs{}, err
+	}
+	return QueueURLs{Transaction: transaction, TransactionDLQ: dlq, EventQueue: eventQueue}, nil
 }
 
 func (m *QueueManager) Check(ctx context.Context) error {

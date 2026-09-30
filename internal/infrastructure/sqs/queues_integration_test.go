@@ -25,6 +25,7 @@ func TestLocalStackTransactionQueues(t *testing.T) {
 		AWSSecretAccessKey: envOr("AWS_SECRET_ACCESS_KEY", "test"),
 		TransactionQueue:   envOr("SQS_TRANSACTION_QUEUE", "wager-transactions.fifo"),
 		TransactionDLQ:     envOr("SQS_TRANSACTION_DLQ", "wager-transactions-dlq.fifo"),
+		EventQueue:         envOr("SQS_EVENT_QUEUE", "wager-events.fifo"),
 		MaxReceiveCount:    maxReceiveCount,
 	}
 	client, err := NewClient(cfg)

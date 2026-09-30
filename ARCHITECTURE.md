@@ -5,7 +5,8 @@ The current runtime is composed with Uber Fx:
 ```text
 HTTP -> application -> ports -> PostgreSQL infrastructure
                                       |
-                                      +-> transactional outbox -> Publisher -> SQS FIFO
+                                      +-> transactional outbox -> Publisher -> event SQS FIFO
+SQS command FIFO -> Consumer -> Inbox + application/domain transaction
 ```
 
 The domain packages do not depend on HTTP, PostgreSQL, AWS SDK, or LocalStack.
@@ -14,7 +15,7 @@ repository flow. Wallet locking, ledger writes, wager transaction state, and
 outbox events remain in the same PostgreSQL transaction.
 
 The transactional outbox is the bridge between the database transaction and the
-SQS FIFO queue. When a wallet or wager transaction is processed, the financial
+event SQS FIFO queue. When a wallet or wager transaction is processed, the financial
 state and the corresponding outbox record are inserted in the same SQL
 transaction. This keeps the money movement durable even when publishing happens
 outside the financial transaction.
@@ -53,7 +54,18 @@ envelope:
 }
 ```
 
-This stage covers only the transactional outbox and the publisher. SQS consumer,
-inbox processing, retry workers beyond the outbox publisher, and reconciliation
-remain for the next stage. The future inbox/consumer will complete idempotent
-processing against the duplicate-delivery window introduced by the outbox.
+The command SQS FIFO queue receives `WagerTransactionRequested` messages. The
+consumer long-polls the queue, groups messages by `MessageGroupId`, records
+`consumer_name + message_id + payload_hash` in PostgreSQL, invokes the same
+financial application use case as HTTP, marks the Inbox row complete, and
+commits Inbox, domain state, ledger, and Outbox changes in one PostgreSQL
+transaction. It deletes the SQS message only after that commit. The Outbox
+Publisher sends `WagerTransactionProcessed`, `WagerTransactionRejected`,
+`WagerTransactionPendingReference`, and `WalletBalanceChanged` to the separate
+event SQS FIFO queue. These events are never interpreted as input commands.
+Failed processing leaves command messages available for redelivery and the
+existing SQS redrive policy remains responsible for the DLQ.
+
+Retry workers for `PENDING_REFERENCE`, authentication, metrics, and
+reconciliation remain outside this stage. The Inbox is the durable protection
+against duplicate delivery and does not rely on SQS deduplication alone.

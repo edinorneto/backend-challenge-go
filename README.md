@@ -51,5 +51,16 @@ uses the `aggregate_id` as the FIFO `MessageGroupId`, and reuses the stable
 `event_id` as `MessageDeduplicationId` so retries remain idempotent at the
 message layer. On failures, it schedules a retry with exponential backoff.
 
-The publisher currently targets the transaction queue only; consumer, inbox, DLQ,
-and reconciliation steps remain for the next stage.
+The `wager-transactions.fifo` queue is the input command queue. Its messages
+have type `WagerTransactionRequested` and are processed by the same financial
+use case used by HTTP. The Outbox Publisher publishes the resulting events to
+the separate `wager-events.fifo` output queue. DLQ and reconciliation remain
+outside this stage.
+
+The transaction queue consumer is lifecycle-managed. It uses long polling,
+processes independent FIFO message groups in parallel, records durable Inbox
+state keyed by `consumer_name` and `message_id`, executes the shared financial
+use case, and commits Inbox, wallet, wager transaction, ledger, and Outbox
+changes in one PostgreSQL transaction. It deletes a message only after that
+commit. Processing failures leave the message for SQS redelivery and the
+configured redrive policy.

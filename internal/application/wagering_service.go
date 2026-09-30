@@ -20,21 +20,13 @@ var (
 	ErrInvalidWagerRequest    = errors.New("invalid wager request")
 )
 
-type WageringRequest struct {
-	ProviderID                     string
-	ExternalTransactionID          string
-	PlayerID                       uuid.UUID
-	WalletID                       uuid.UUID
-	RoundID                        string
-	GameID                         string
-	Kind                           string
-	Amount                         money.Money
-	ReferenceExternalTransactionID string
-}
+type WageringRequest = ports.WageringRequest
 
 type WageringService struct {
 	repo ports.WageringRepository
 }
+
+var _ ports.WageringService = (*WageringService)(nil)
 
 func NewWageringService(repo ports.WageringRepository) *WageringService {
 	return &WageringService{repo: repo}
@@ -43,7 +35,7 @@ func NewWageringService(repo ports.WageringRepository) *WageringService {
 func (s *WageringService) ProcessTransaction(
 	ctx context.Context,
 	idempotencyKey string,
-	req WageringRequest,
+	req ports.WageringRequest,
 ) (ports.ProcessTransactionResult, error) {
 	if strings.TrimSpace(idempotencyKey) == "" {
 		return ports.ProcessTransactionResult{}, ErrIdempotencyKeyRequired

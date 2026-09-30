@@ -407,9 +407,14 @@ func (r *WalletRepo) ProcessTransaction(
 	}
 
 	now := time.Now().UTC()
-	tx, err := r.DB.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return ports.ProcessTransactionResult{}, fmt.Errorf("begin wagering transaction: %w", err)
+	tx := txFromContext(ctx)
+	var err error
+	ownsTx := tx == nil
+	if ownsTx {
+		tx, err = r.DB.BeginTx(ctx, pgx.TxOptions{})
+		if err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("begin wagering transaction: %w", err)
+		}
 	}
 	defer tx.Rollback(ctx)
 
@@ -494,8 +499,10 @@ func (r *WalletRepo) ProcessTransaction(
 		if duplicateErr != nil {
 			return ports.ProcessTransactionResult{}, duplicateErr
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return ports.ProcessTransactionResult{}, fmt.Errorf("commit duplicate transaction: %w", err)
+		if ownsTx {
+			if err := tx.Commit(ctx); err != nil {
+				return ports.ProcessTransactionResult{}, fmt.Errorf("commit duplicate transaction: %w", err)
+			}
 		}
 		return result, nil
 	}
@@ -516,8 +523,10 @@ func (r *WalletRepo) ProcessTransaction(
 		if err != nil {
 			return ports.ProcessTransactionResult{}, err
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return ports.ProcessTransactionResult{}, fmt.Errorf("commit pending reference: %w", err)
+		if ownsTx {
+			if err := tx.Commit(ctx); err != nil {
+				return ports.ProcessTransactionResult{}, fmt.Errorf("commit pending reference: %w", err)
+			}
 		}
 		return result, nil
 	}
@@ -786,8 +795,10 @@ func (r *WalletRepo) ProcessTransaction(
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return ports.ProcessTransactionResult{}, fmt.Errorf("commit wagering transaction: %w", err)
+	if ownsTx {
+		if err := tx.Commit(ctx); err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("commit wagering transaction: %w", err)
+		}
 	}
 
 	return ports.ProcessTransactionResult{

@@ -3,6 +3,7 @@ set -eu
 
 QUEUE_NAME="${SQS_TRANSACTION_QUEUE:-wager-transactions.fifo}"
 DLQ_NAME="${SQS_TRANSACTION_DLQ:-wager-transactions-dlq.fifo}"
+EVENT_QUEUE_NAME="${SQS_EVENT_QUEUE:-wager-events.fifo}"
 MAX_RECEIVE_COUNT="${SQS_MAX_RECEIVE_COUNT:-5}"
 
 awslocal sqs create-queue \
@@ -24,4 +25,10 @@ awslocal sqs create-queue \
   --query QueueUrl \
   --output text
 
-echo "Created SQS queues: $QUEUE_NAME and $DLQ_NAME"
+awslocal sqs create-queue \
+  --queue-name "$EVENT_QUEUE_NAME" \
+  --attributes FifoQueue=true,ContentBasedDeduplication=true \
+  --query QueueUrl \
+  --output text
+
+echo "Created SQS queues: $QUEUE_NAME, $DLQ_NAME and $EVENT_QUEUE_NAME"

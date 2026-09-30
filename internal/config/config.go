@@ -17,6 +17,7 @@ type Config struct {
 	AWSSecretAccessKey   string
 	TransactionQueue     string
 	TransactionDLQ       string
+	EventQueue           string
 	MaxReceiveCount      int
 	OutboxBatchSize      int
 	OutboxPollInterval   time.Duration
@@ -34,6 +35,7 @@ func Load() (Config, error) {
 		AWSSecretAccessKey:   os.Getenv("AWS_SECRET_ACCESS_KEY"),
 		TransactionQueue:     getEnv("SQS_TRANSACTION_QUEUE", "wager-transactions.fifo"),
 		TransactionDLQ:       getEnv("SQS_TRANSACTION_DLQ", "wager-transactions-dlq.fifo"),
+		EventQueue:           getEnv("SQS_EVENT_QUEUE", "wager-events.fifo"),
 		OutboxBatchSize:      10,
 		OutboxPollInterval:   time.Second,
 		OutboxLeaseDuration:  30 * time.Second,
@@ -51,11 +53,14 @@ func Load() (Config, error) {
 	if strings.TrimSpace(cfg.AWSRegion) == "" {
 		return Config{}, errors.New("AWS_REGION must not be empty")
 	}
-	if strings.TrimSpace(cfg.TransactionQueue) == "" || strings.TrimSpace(cfg.TransactionDLQ) == "" {
+	if strings.TrimSpace(cfg.TransactionQueue) == "" || strings.TrimSpace(cfg.TransactionDLQ) == "" || strings.TrimSpace(cfg.EventQueue) == "" {
 		return Config{}, errors.New("SQS queue names must not be empty")
 	}
 	if cfg.TransactionQueue == cfg.TransactionDLQ {
 		return Config{}, errors.New("SQS transaction queue and DLQ must differ")
+	}
+	if cfg.EventQueue == cfg.TransactionQueue || cfg.EventQueue == cfg.TransactionDLQ {
+		return Config{}, errors.New("SQS event queue must differ from transaction queue and DLQ")
 	}
 
 	return cfg, nil

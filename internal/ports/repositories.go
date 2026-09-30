@@ -30,6 +30,18 @@ type ProcessTransactionRequest struct {
 	ReferenceExternalTransactionID string
 }
 
+type WageringRequest struct {
+	ProviderID                     string
+	ExternalTransactionID          string
+	PlayerID                       uuid.UUID
+	WalletID                       uuid.UUID
+	RoundID                        string
+	GameID                         string
+	Kind                           string
+	Amount                         money.Money
+	ReferenceExternalTransactionID string
+}
+
 type ProcessTransactionResult struct {
 	TransactionID    uuid.UUID
 	Status           string
@@ -47,6 +59,19 @@ type WageringRepository interface {
 		ctx context.Context,
 		transactionID uuid.UUID,
 	) (ProcessTransactionResult, error)
+}
+
+type Transaction interface {
+	Commit(ctx context.Context) error
+	Rollback(ctx context.Context) error
+}
+
+type TransactionManager interface {
+	Begin(ctx context.Context) (context.Context, Transaction, error)
+}
+
+type WageringService interface {
+	ProcessTransaction(ctx context.Context, idempotencyKey string, req WageringRequest) (ProcessTransactionResult, error)
 }
 
 type OutboxEvent struct {
@@ -83,4 +108,22 @@ type OutboxRepository interface {
 	ClaimPending(ctx context.Context, limit int, leaseDuration time.Duration, owner string) ([]OutboxEvent, error)
 	MarkPublished(ctx context.Context, eventID uuid.UUID, owner string) error
 	Reschedule(ctx context.Context, eventID uuid.UUID, attempts int, nextAttemptAt time.Time, lastError string, owner string) error
+}
+
+type QueueMessage struct {
+	MessageID     string
+	ReceiptHandle string
+	Body          string
+	MessageGroup  string
+}
+
+type QueueReceiver interface {
+	Receive(ctx context.Context, batchSize int, waitTimeSeconds int, visibilityTimeoutSeconds int) ([]QueueMessage, error)
+	Delete(ctx context.Context, receiptHandle string) error
+}
+
+type InboxEffect = func(ctx context.Context, envelope []byte) error
+
+type InboxRepository interface {
+	Process(ctx context.Context, consumerName string, messageID string, payload []byte, effect InboxEffect) (duplicate bool, err error)
 }
