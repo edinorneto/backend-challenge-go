@@ -39,6 +39,17 @@ Stop the environment:
 docker compose down
 ```
 
-The PostgreSQL outbox is already persisted transactionally by the application.
-SQS connectivity and queue discovery are prepared here; the outbox publisher,
-SQS consumer, and inbox processing are intentionally not implemented yet.
+## Outbox publisher
+
+This version implements the transactional outbox and the publisher worker. Every
+financial mutation still writes the wallet and wager data and inserts the
+corresponding outbox event in the same PostgreSQL transaction. The publish step
+runs outside the financial transaction in a dedicated worker.
+
+The worker claims a small pending batch with PostgreSQL lock-skipping semantics,
+uses the `aggregate_id` as the FIFO `MessageGroupId`, and reuses the stable
+`event_id` as `MessageDeduplicationId` so retries remain idempotent at the
+message layer. On failures, it schedules a retry with exponential backoff.
+
+The publisher currently targets the transaction queue only; consumer, inbox, DLQ,
+and reconciliation steps remain for the next stage.

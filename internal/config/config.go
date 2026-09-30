@@ -5,30 +5,39 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	DatabaseURL        string
-	HTTPAddr           string
-	AWSRegion          string
-	AWSEndpoint        string
-	AWSAccessKeyID     string
-	AWSSecretAccessKey string
-	TransactionQueue   string
-	TransactionDLQ     string
-	MaxReceiveCount    int
+	DatabaseURL          string
+	HTTPAddr             string
+	AWSRegion            string
+	AWSEndpoint          string
+	AWSAccessKeyID       string
+	AWSSecretAccessKey   string
+	TransactionQueue     string
+	TransactionDLQ       string
+	MaxReceiveCount      int
+	OutboxBatchSize      int
+	OutboxPollInterval   time.Duration
+	OutboxLeaseDuration  time.Duration
+	OutboxRetryBaseDelay time.Duration
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		DatabaseURL:        getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/betting"),
-		HTTPAddr:           getEnv("HTTP_ADDR", ":8080"),
-		AWSRegion:          getEnv("AWS_REGION", "us-east-1"),
-		AWSEndpoint:        getEnv("AWS_ENDPOINT", ""),
-		AWSAccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
-		AWSSecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
-		TransactionQueue:   getEnv("SQS_TRANSACTION_QUEUE", "wager-transactions.fifo"),
-		TransactionDLQ:     getEnv("SQS_TRANSACTION_DLQ", "wager-transactions-dlq.fifo"),
+		DatabaseURL:          getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/betting"),
+		HTTPAddr:             getEnv("HTTP_ADDR", ":8080"),
+		AWSRegion:            getEnv("AWS_REGION", "us-east-1"),
+		AWSEndpoint:          getEnv("AWS_ENDPOINT", ""),
+		AWSAccessKeyID:       os.Getenv("AWS_ACCESS_KEY_ID"),
+		AWSSecretAccessKey:   os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		TransactionQueue:     getEnv("SQS_TRANSACTION_QUEUE", "wager-transactions.fifo"),
+		TransactionDLQ:       getEnv("SQS_TRANSACTION_DLQ", "wager-transactions-dlq.fifo"),
+		OutboxBatchSize:      10,
+		OutboxPollInterval:   time.Second,
+		OutboxLeaseDuration:  30 * time.Second,
+		OutboxRetryBaseDelay: time.Second,
 	}
 	maxReceiveCount, err := strconv.Atoi(getEnv("SQS_MAX_RECEIVE_COUNT", "5"))
 	if err != nil || maxReceiveCount <= 0 {

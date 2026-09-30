@@ -48,7 +48,7 @@ func (r *Runner) Up(ctx context.Context) error {
 		return fmt.Errorf("create schema_migrations table: %w", err)
 	}
 
-	for version := int64(1); version <= 2; version++ {
+	for version := int64(1); version <= 3; version++ {
 		var applied bool
 		err = r.pool.QueryRow(
 			migrationCtx,

@@ -24,32 +24,52 @@ func main() {
 			migrations.NewRunner,
 			sqs.NewClient,
 			sqs.NewQueueManager,
-
 			database.NewWalletRepo,
+			database.NewOutboxRepo,
 			func(repo *database.WalletRepo) ports.WalletRepository {
 				return repo
 			},
 			func(repo *database.WalletRepo) ports.WageringRepository {
 				return repo
 			},
+			func(repo *database.OutboxRepo) ports.OutboxRepository {
+				return repo
+			},
+			sqs.NewPublisher,
 
 			application.NewWalletService,
 			application.NewWageringService,
+			application.NewOutboxPublisher,
 			httpapi.NewServer,
 		),
 
 		fx.Invoke(
 			func(_ *migrations.Runner) {},
-			checkSQS,
+			startOutboxPublisher,
 			runHTTP,
 		),
 	).Run()
 }
 
-func checkSQS(lc fx.Lifecycle, manager *sqs.QueueManager) {
+func startOutboxPublisher(
+	lc fx.Lifecycle,
+	manager *sqs.QueueManager,
+	sqsPublisher *sqs.Publisher,
+	publisher *application.OutboxPublisher,
+) {
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
-			return manager.Check(ctx)
+			urls, err := manager.Resolve(ctx)
+			if err != nil {
+				return err
+			}
+			if err := sqsPublisher.ConfigureQueueURL(urls.Transaction); err != nil {
+				return err
+			}
+			return publisher.Start(ctx)
+		},
+		OnStop: func(ctx context.Context) error {
+			return publisher.Stop(ctx)
 		},
 	})
 }
