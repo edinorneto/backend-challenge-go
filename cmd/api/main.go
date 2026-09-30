@@ -38,7 +38,13 @@ func main() {
 			func(repo *database.OutboxRepo) ports.OutboxRepository {
 				return repo
 			},
+			func(repo *database.InboxRepo) ports.InboxRepository {
+				return repo
+			},
 			sqs.NewPublisher,
+			func(publisher *sqs.Publisher) ports.OutboxMessagePublisher {
+				return publisher
+			},
 			application.NewWalletService,
 			application.NewWageringService,
 			application.NewOutboxPublisher,
@@ -82,10 +88,10 @@ func startMessaging(
 			if err := receiver.ConfigureQueueURL(urls.Transaction); err != nil {
 				return err
 			}
-			if err := publisher.Start(ctx); err != nil {
+			if err := publisher.Start(context.Background()); err != nil {
 				return err
 			}
-			if err := consumer.Start(ctx); err != nil {
+			if err := consumer.Start(context.Background()); err != nil {
 				_ = publisher.Stop(ctx)
 				return err
 			}

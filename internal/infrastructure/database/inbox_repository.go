@@ -45,7 +45,9 @@ func (r *InboxRepo) Process(
 			return false, fmt.Errorf("begin inbox transaction: %w", err)
 		}
 	}
-	defer tx.Rollback(ctx)
+	if ownsTx {
+		defer tx.Rollback(ctx)
+	}
 
 	var inboxID uuid.UUID
 	err = tx.QueryRow(ctx, `

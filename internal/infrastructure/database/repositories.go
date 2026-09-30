@@ -416,7 +416,9 @@ func (r *WalletRepo) ProcessTransaction(
 			return ports.ProcessTransactionResult{}, fmt.Errorf("begin wagering transaction: %w", err)
 		}
 	}
-	defer tx.Rollback(ctx)
+	if ownsTx {
+		defer tx.Rollback(ctx)
+	}
 
 	transactionID := uuid.New()
 	insertResult, err := tx.Exec(

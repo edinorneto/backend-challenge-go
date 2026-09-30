@@ -19,15 +19,10 @@ type Server struct {
 	wagering *application.WageringService
 }
 
-func NewServer(wallets *application.WalletService, wagering ...*application.WageringService) *Server {
-	var service *application.WageringService
-	if len(wagering) > 0 {
-		service = wagering[0]
-	}
-
+func NewServer(wallets *application.WalletService, wagering *application.WageringService) *Server {
 	return &Server{
 		wallets:  wallets,
-		wagering: service,
+		wagering: wagering,
 	}
 }
 
