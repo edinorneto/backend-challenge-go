@@ -357,7 +357,7 @@ func TestTwoOutboxPublishersPublishConcurrentEventsOnce(t *testing.T) {
 	for index := 0; index < operationCount; index++ {
 		playerID := uuid.New()
 		walletID := uuid.New()
-		testWallet, err := wallet.New(walletID, playerID, mustMoney(t, "100.00"), time.Now().UTC())
+		testWallet, err := wallet.New(walletID, playerID, mustMoney(t, "0.00"), time.Now().UTC())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -374,7 +374,7 @@ func TestTwoOutboxPublishersPublishConcurrentEventsOnce(t *testing.T) {
 			WalletID:              walletID,
 			RoundID:               "publishers-round-" + uuid.New().String(),
 			GameID:                "publishers-game",
-			Kind:                  "BET",
+			Kind:                  "WIN",
 			Amount:                mustMoney(t, "10.00"),
 		})
 		if err != nil {

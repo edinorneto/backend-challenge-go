@@ -92,7 +92,7 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messageID := sendRecoveryMessage(
+	sqsMessageID := sendRecoveryMessage(
 		t,
 		cfg,
 		transactionQueueURL,
@@ -102,7 +102,7 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 	)
 
 	t.Cleanup(func() {
-		cleanupRecoveryMessage(t, transactionQueueURL, messageID)
+		cleanupRecoveryMessage(t, transactionQueueURL, sqsMessageID)
 
 		_, _ = pool.Exec(
 			ctx,
@@ -361,10 +361,10 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 		t.Fatalf("expected one redelivery, got %d", len(secondIDs))
 	}
 
-	if firstIDs[0] != messageID {
+	if firstIDs[0] != sqsMessageID {
 		t.Fatalf(
 			"expected first SQS delivery to use message ID %s, got %s",
-			messageID,
+			sqsMessageID,
 			firstIDs[0],
 		)
 	}
@@ -445,7 +445,7 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
           AND message_id = $2
         `,
 		"transaction-consumer",
-		messageID,
+		commandMessageID,
 	).Scan(&inboxCount); err != nil {
 		t.Fatal(err)
 	}
