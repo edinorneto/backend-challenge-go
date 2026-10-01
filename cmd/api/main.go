@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/edinorneto/backend-challenge-go/internal/application"
+	"github.com/edinorneto/backend-challenge-go/internal/auth"
 	"github.com/edinorneto/backend-challenge-go/internal/config"
 	"github.com/edinorneto/backend-challenge-go/internal/httpapi"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database"
@@ -20,6 +21,8 @@ func main() {
 	fx.New(
 		fx.Provide(
 			config.Load,
+			auth.NewVerifier,
+			auth.NewMiddleware,
 			database.NewPool,
 			migrations.NewRunner,
 			sqs.NewClient,

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/edinorneto/backend-challenge-go/internal/application"
+	"github.com/edinorneto/backend-challenge-go/internal/auth"
 	"github.com/edinorneto/backend-challenge-go/internal/domain/money"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database"
 )
@@ -17,12 +18,14 @@ import (
 type Server struct {
 	wallets  *application.WalletService
 	wagering *application.WageringService
+	auth     *auth.Middleware
 }
 
-func NewServer(wallets *application.WalletService, wagering *application.WageringService) *Server {
+func NewServer(wallets *application.WalletService, wagering *application.WageringService, middleware *auth.Middleware) *Server {
 	return &Server{
 		wallets:  wallets,
 		wagering: wagering,
+		auth:     middleware,
 	}
 }
 
@@ -30,9 +33,9 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health/live", s.liveHandler)
-	mux.HandleFunc("POST /wallets", s.walletsHandler)
-	mux.HandleFunc("GET /wallets/{walletID}", s.getWalletHandler)
-	mux.HandleFunc("POST /wagering/transactions", s.wageringHandler)
+	mux.Handle("POST /wallets", s.auth.Require(http.HandlerFunc(s.walletsHandler), "wallet-internal"))
+	mux.Handle("GET /wallets/{walletID}", s.auth.Require(http.HandlerFunc(s.getWalletHandler), "wallet-internal"))
+	mux.Handle("POST /wagering/transactions", s.auth.Require(http.HandlerFunc(s.wageringHandler)))
 
 	return loggingMiddleware(mux)
 }
@@ -193,7 +196,6 @@ func (s *Server) wageringHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ProviderID            string `json:"providerId"`
 		ExternalTransactionID string `json:"externalTransactionId"`
 		PlayerID              string `json:"playerId"`
 		WalletID              string `json:"walletId"`
@@ -247,9 +249,14 @@ func (s *Server) wageringHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	identity, ok := auth.IdentityFromContext(r.Context())
+	if !ok || identity.ProviderID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "provider_identity_required"})
+		return
+	}
 
 	result, err := s.wagering.ProcessTransaction(r.Context(), idempotencyKey, application.WageringRequest{
-		ProviderID:                     req.ProviderID,
+		ProviderID:                     identity.ProviderID,
 		ExternalTransactionID:          req.ExternalTransactionID,
 		PlayerID:                       playerID,
 		WalletID:                       walletID,

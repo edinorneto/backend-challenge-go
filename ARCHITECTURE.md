@@ -20,6 +20,16 @@ state and the corresponding outbox record are inserted in the same SQL
 transaction. This keeps the money movement durable even when publishing happens
 outside the financial transaction.
 
+HTTP wallet and wagering routes are protected by an OIDC middleware. The
+middleware validates Bearer tokens using the configured issuer and JWKS,
+including expiration and audience when configured, then places an identity in
+the request context. Wagering derives `provider_id` exclusively from the
+configured provider claim, so a body field cannot switch providers. Wallet
+creation and reads require the `wallet-internal` role and are restricted to
+the `backend-internal` service account; provider users do not receive wallet
+roles. Liveness remains public. The application domain and
+`WageringService` do not depend on the OIDC library.
+
 The publisher is implemented as a separate application worker. It claims a small
 batch of pending outbox rows using PostgreSQL `FOR UPDATE SKIP LOCKED`, checks
 `next_attempt_at`, and releases a lease via `locked_at` so multiple application

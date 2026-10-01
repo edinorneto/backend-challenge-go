@@ -1,0 +1,208 @@
+{
+  "realm": "backend",
+  "enabled": true,
+  "verifyEmail": false,
+  "displayName": "Backend Challenge",
+  "roles": {
+    "realm": [
+      {
+        "name": "wallet-internal",
+        "description": "Allows internal service operations on wallets"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "backend-api",
+      "name": "Backend API",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "defaultClientScopes": [
+        "basic",
+        "roles",
+        "provider-identity"
+      ],
+      "protocolMappers": [
+        {
+          "name": "backend-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "backend-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "http://localhost:8080/*"
+      }
+    },
+    {
+      "clientId": "backend-internal",
+      "name": "Backend Internal Service",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "backend-internal-secret",
+      "serviceAccountsEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "standardFlowEnabled": false,
+      "defaultClientScopes": [
+        "basic",
+        "roles",
+        "provider-identity"
+      ],
+      "protocolMappers": [
+        {
+          "name": "backend-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "backend-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "provider-a",
+      "enabled": true,
+      "email": "provider-a@example.com",
+      "emailVerified": true,
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "provider-a",
+          "temporary": false
+        }
+      ],
+      "attributes": {
+        "provider_id": [
+          "provider-a"
+        ]
+      },
+      "realmRoles": [],
+      "firstName": "Provider",
+      "lastName": "A"
+    },
+    {
+      "username": "provider-b",
+      "enabled": true,
+      "email": "provider-b@example.com",
+      "emailVerified": true,
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "provider-b",
+          "temporary": false
+        }
+      ],
+      "attributes": {
+        "provider_id": [
+          "provider-b"
+        ]
+      },
+      "realmRoles": [],
+      "firstName": "Provider",
+      "lastName": "B"
+    },
+    {
+      "username": "service-account-backend-internal",
+      "enabled": true,
+      "email": "service-account-backend-internal@example.com",
+      "emailVerified": true,
+      "firstName": "Backend",
+      "lastName": "Internal",
+      "requiredActions": [],
+      "serviceAccountClientId": "backend-internal",
+      "attributes": {
+        "provider_id": [
+          "internal-service"
+        ]
+      },
+      "realmRoles": [
+        "wallet-internal"
+      ]
+    }
+  ],
+  "clientScopes": [
+    {
+      "name": "basic",
+      "description": "OpenID Connect scope for basic claims",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-sub-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "roles",
+      "description": "OpenID Connect scope for realm roles",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "foo",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String",
+            "multivalued": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "provider-identity",
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "provider_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "provider_id",
+            "claim.name": "provider_id",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

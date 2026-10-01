@@ -18,6 +18,24 @@ The stack provides:
 - the API at `localhost:8080`;
 - `wager-transactions.fifo`;
 - `wager-transactions-dlq.fifo`.
+- Keycloak at `http://localhost:8081`, with realm `backend`.
+
+The protected wagering endpoint requires a Bearer token issued by
+Keycloak. Wallet operations are restricted to the internal service client. The development realm imports users `provider-a` and `provider-b`;
+their passwords match their usernames. Obtain a token with:
+
+```sh
+curl -X POST http://localhost:8081/realms/backend/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=backend-api \
+  -d username=provider-a -d password=provider-a
+```
+
+The API validates the token signature against Keycloak JWKS, issuer, expiry,
+and the configured audience. The `provider_id` claim is the only source of
+provider identity for wagering; `providerId` in an HTTP body is ignored.
+Wallet creation and reads require the `wallet-internal` role and are intended for
+the `backend-internal` service account. Provider identities are authenticated for
+wagering operations only. Liveness remains public.
 
 LocalStack creates both FIFO queues from
 `localstack/init/ready.d/01-init-sqs.sh`. The transaction queue has a redrive
@@ -64,3 +82,15 @@ use case, and commits Inbox, wallet, wager transaction, ledger, and Outbox
 changes in one PostgreSQL transaction. It deletes a message only after that
 commit. Processing failures leave the message for SQS redelivery and the
 configured redrive policy.
+
+### Internal wallet access
+
+The `backend-internal` client uses OAuth 2.0 `client_credentials`. Its service
+account receives the `wallet-internal` realm role. Example token request:
+
+```sh
+curl -X POST http://localhost:8081/realms/backend/protocol/openid-connect/token \
+  -d grant_type=client_credentials \
+  -d client_id=backend-internal \
+  -d client_secret=backend-internal-secret
+```

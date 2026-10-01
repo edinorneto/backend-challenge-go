@@ -23,6 +23,7 @@ services:
       AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
       SQS_TRANSACTION_QUEUE: ${SQS_TRANSACTION_QUEUE:-wager-transactions.fifo}
       SQS_TRANSACTION_DLQ: ${SQS_TRANSACTION_DLQ:-wager-transactions-dlq.fifo}
+      SQS_EVENT_QUEUE: ${SQS_EVENT_QUEUE:-wager-events.fifo}
       SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
       SERVICES: sqs
     ports:
@@ -30,10 +31,24 @@ services:
     volumes:
       - "./localstack/init/ready.d:/etc/localstack/init/ready.d"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health | grep -q sqs"]
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name \"$${SQS_TRANSACTION_QUEUE:-wager-transactions.fifo}\" >/dev/null 2>&1 && awslocal sqs get-queue-url --queue-name \"$${SQS_TRANSACTION_DLQ:-wager-transactions-dlq.fifo}\" >/dev/null 2>&1 && awslocal sqs get-queue-url --queue-name \"$${SQS_EVENT_QUEUE:-wager-events.fifo}\" >/dev/null 2>&1"]
       interval: 5s
       timeout: 5s
       retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: http://localhost:8081
+    ports:
+      - "8081:8080"
+    volumes:
+      - "./keycloak:/opt/keycloak/data/import"
 
   application:
     build:
@@ -46,6 +61,10 @@ services:
       AWS_ENDPOINT: http://localstack:4566
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-http://localhost:8081/realms/backend}
+      OIDC_JWKS_URL: ${OIDC_JWKS_URL:-http://keycloak:8080/realms/backend/protocol/openid-connect/certs}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-backend-api}
+      OIDC_PROVIDER_CLAIM: ${OIDC_PROVIDER_CLAIM:-provider_id}
       SQS_TRANSACTION_QUEUE: ${SQS_TRANSACTION_QUEUE:-wager-transactions.fifo}
       SQS_TRANSACTION_DLQ: ${SQS_TRANSACTION_DLQ:-wager-transactions-dlq.fifo}
       SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
@@ -56,5 +75,7 @@ services:
         condition: service_healthy
       localstack:
         condition: service_healthy
+      keycloak:
+        condition: service_started
 volumes:
   postgres_data:

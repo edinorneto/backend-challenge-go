@@ -15,6 +15,10 @@ type Config struct {
 	AWSEndpoint          string
 	AWSAccessKeyID       string
 	AWSSecretAccessKey   string
+	OIDCIssuerURL        string
+	OIDCJWKSURL          string
+	OIDCAudience         string
+	OIDCProviderClaim    string
 	TransactionQueue     string
 	TransactionDLQ       string
 	EventQueue           string
@@ -33,6 +37,10 @@ func Load() (Config, error) {
 		AWSEndpoint:          getEnv("AWS_ENDPOINT", ""),
 		AWSAccessKeyID:       os.Getenv("AWS_ACCESS_KEY_ID"),
 		AWSSecretAccessKey:   os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		OIDCIssuerURL:        getEnv("OIDC_ISSUER_URL", "http://localhost:8081/realms/backend"),
+		OIDCJWKSURL:          getEnv("OIDC_JWKS_URL", "http://localhost:8081/realms/backend/protocol/openid-connect/certs"),
+		OIDCAudience:         os.Getenv("OIDC_AUDIENCE"),
+		OIDCProviderClaim:    getEnv("OIDC_PROVIDER_CLAIM", "provider_id"),
 		TransactionQueue:     getEnv("SQS_TRANSACTION_QUEUE", "wager-transactions.fifo"),
 		TransactionDLQ:       getEnv("SQS_TRANSACTION_DLQ", "wager-transactions-dlq.fifo"),
 		EventQueue:           getEnv("SQS_EVENT_QUEUE", "wager-events.fifo"),
@@ -52,6 +60,12 @@ func Load() (Config, error) {
 	}
 	if strings.TrimSpace(cfg.AWSRegion) == "" {
 		return Config{}, errors.New("AWS_REGION must not be empty")
+	}
+	if strings.TrimSpace(cfg.OIDCIssuerURL) == "" || strings.TrimSpace(cfg.OIDCJWKSURL) == "" {
+		return Config{}, errors.New("OIDC_ISSUER_URL and OIDC_JWKS_URL must not be empty")
+	}
+	if strings.TrimSpace(cfg.OIDCProviderClaim) == "" {
+		return Config{}, errors.New("OIDC_PROVIDER_CLAIM must not be empty")
 	}
 	if strings.TrimSpace(cfg.TransactionQueue) == "" || strings.TrimSpace(cfg.TransactionDLQ) == "" || strings.TrimSpace(cfg.EventQueue) == "" {
 		return Config{}, errors.New("SQS queue names must not be empty")
