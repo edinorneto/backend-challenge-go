@@ -88,7 +88,8 @@ func ParseExternal(amount string, currency string) (Money, error) {
 		return Money{}, ErrInvalidAmount
 	}
 
-	if integerValue > (math.MaxInt64-decimalValue)/100 {
+	if integerValue > math.MaxInt64/100 ||
+		(integerValue == math.MaxInt64/100 && decimalValue > math.MaxInt64%100) {
 		return Money{}, ErrOverflow
 	}
 

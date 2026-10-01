@@ -14,6 +14,8 @@ import (
 type WalletRepository interface {
 	Create(ctx context.Context, w *wallet.Wallet) error
 	Get(ctx context.Context, id uuid.UUID) (*wallet.Wallet, error)
+	GetLedger(ctx context.Context, walletID uuid.UUID, cursor string, limit int) ([]LedgerEntryView, string, error)
+	Reconcile(ctx context.Context, walletID uuid.UUID) (ReconciliationView, error)
 }
 
 type ProcessTransactionRequest struct {
@@ -59,6 +61,50 @@ type WageringRepository interface {
 		ctx context.Context,
 		transactionID uuid.UUID,
 	) (ProcessTransactionResult, error)
+	GetTransaction(ctx context.Context, transactionID uuid.UUID) (TransactionView, error)
+	GetTransactionByExternal(ctx context.Context, providerID, externalTransactionID string) (TransactionView, error)
+}
+
+type LedgerEntryView struct {
+	ID            uuid.UUID
+	WalletID      uuid.UUID
+	TransactionID uuid.UUID
+	Direction     string
+	Amount        money.Money
+	BalanceBefore money.Money
+	BalanceAfter  money.Money
+	CreatedAt     time.Time
+}
+
+type ReconciliationView struct {
+	WalletID          uuid.UUID
+	StoredBalance     money.Money
+	CalculatedBalance money.Money
+	Difference        money.Money
+	Consistent        bool
+	CheckedEntries    int
+}
+
+type TransactionView struct {
+	ID                     uuid.UUID
+	ProviderID             string
+	ExternalTransactionID  string
+	IdempotencyKey         string
+	PlayerID               uuid.UUID
+	WalletID               uuid.UUID
+	RoundID                string
+	GameID                 string
+	Kind                   string
+	Status                 string
+	Amount                 money.Money
+	FailureCode            string
+	ReferenceExternalID    string
+	ReferenceTransactionID uuid.UUID
+	ResultBalance          money.Money
+	ResultWalletVersion    int64
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+	ProcessedAt            *time.Time
 }
 
 type PendingReferenceRepository interface {

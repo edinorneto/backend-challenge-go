@@ -3,13 +3,16 @@ package messaging
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 type WagerTransactionRequested struct {
-	Type string               `json:"type"`
-	Data WagerTransactionData `json:"data"`
+	MessageID  string               `json:"messageId"`
+	Type       string               `json:"type"`
+	OccurredAt time.Time            `json:"occurredAt"`
+	Data       WagerTransactionData `json:"data"`
 }
 
 type WagerTransactionData struct {
@@ -31,6 +34,9 @@ type MoneyData struct {
 }
 
 func (c WagerTransactionRequested) Validate() error {
+	if strings.TrimSpace(c.MessageID) == "" || c.OccurredAt.IsZero() {
+		return errors.New("invalid transaction command metadata")
+	}
 	if c.Type != "WagerTransactionRequested" {
 		return errors.New("invalid transaction command type")
 	}

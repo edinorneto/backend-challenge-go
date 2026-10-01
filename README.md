@@ -83,6 +83,52 @@ changes in one PostgreSQL transaction. It deletes a message only after that
 commit. Processing failures leave the message for SQS redelivery and the
 configured redrive policy.
 
+Command messages use the following envelope:
+
+```json
+{
+  "messageId": "durable-command-id",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-09-30T12:00:00Z",
+  "data": {
+    "providerId": "provider-a",
+    "externalTransactionId": "external-1",
+    "idempotencyKey": "provider-a:external-1",
+    "playerId": "00000000-0000-0000-0000-000000000001",
+    "walletId": "00000000-0000-0000-0000-000000000002",
+    "roundId": "round-1",
+    "gameId": "game-1",
+    "kind": "BET",
+    "money": { "amount": "25.00", "currency": "BRL" }
+  }
+}
+```
+
+`messageId` is the durable Inbox identity and is distinct from the AWS SQS
+message ID. `data.idempotencyKey` protects the financial operation. Invalid
+commands are not deleted; SQS visibility and the configured redrive policy
+control retry and DLQ transfer.
+
+## HTTP read and reconciliation endpoints
+
+Wallet endpoints require the `wallet-internal` role. Wagering endpoints require
+an authenticated provider identity. Provider lookup paths must match the
+authenticated `provider_id` claim.
+
+- `GET /wallets/{walletId}` returns the current wallet balance and version.
+- `GET /wallets/{walletId}/ledger?cursor=...&limit=50` returns a stable,
+  descending ledger page. The opaque cursor is based on `(created_at, id)`;
+  `limit` defaults to 50 and accepts values from 1 through 100.
+- `GET /wagering/transactions/{transactionId}` returns the persisted operation
+  result, status, failure code, reference and balance result.
+- `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}`
+  returns a provider operation only when the path provider matches the
+  authenticated identity.
+- `POST /wallets/{walletId}/reconciliation` compares the stored balance with
+  the signed sum of ledger credits and debits. It returns `storedBalance`,
+  `calculatedBalance`, `difference`, `consistent` and `checkedEntries` and
+  never changes financial state.
+
 ### Internal wallet access
 
 The `backend-internal` client uses OAuth 2.0 `client_credentials`. Its service

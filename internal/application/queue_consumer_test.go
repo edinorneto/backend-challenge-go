@@ -124,7 +124,9 @@ func validBody() string {
 
 func validCommandBody() string {
 	body, _ := json.Marshal(map[string]any{
-		"type": "WagerTransactionRequested",
+		"messageId":  "command-message-1",
+		"type":       "WagerTransactionRequested",
+		"occurredAt": "2026-09-30T12:00:00Z",
 		"data": map[string]any{
 			"providerId":            "provider",
 			"externalTransactionId": "external",

@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -410,6 +411,136 @@ func (r *WalletRepo) Get(ctx context.Context, id uuid.UUID) (*wallet.Wallet, err
 	}
 
 	return w, nil
+}
+
+func (r *WalletRepo) GetLedger(ctx context.Context, walletID uuid.UUID, cursor string, limit int) ([]ports.LedgerEntryView, string, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	var cursorCreatedAt time.Time
+	var cursorID uuid.UUID
+	hasCursor := cursor != ""
+	if hasCursor {
+		decoded, err := base64.RawURLEncoding.DecodeString(cursor)
+		if err != nil {
+			return nil, "", fmt.Errorf("decode ledger cursor: %w", err)
+		}
+		parts := strings.Split(string(decoded), "|")
+		if len(parts) != 2 {
+			return nil, "", errors.New("invalid ledger cursor")
+		}
+		cursorCreatedAt, err = time.Parse(time.RFC3339Nano, parts[0])
+		if err != nil {
+			return nil, "", errors.New("invalid ledger cursor")
+		}
+		cursorID, err = uuid.Parse(parts[1])
+		if err != nil {
+			return nil, "", errors.New("invalid ledger cursor")
+		}
+	}
+
+	query := `
+		SELECT id, wallet_id, transaction_id, direction, amount_cents, currency,
+		       balance_before_cents, balance_after_cents, created_at
+		FROM wallet_ledger_entries
+		WHERE wallet_id = $1`
+	args := []any{walletID}
+	if hasCursor {
+		query += ` AND (created_at, id) < ($2, $3)`
+		args = append(args, cursorCreatedAt, cursorID)
+	}
+	query += fmt.Sprintf(` ORDER BY created_at DESC, id DESC LIMIT $%d`, len(args)+1)
+	args = append(args, limit+1)
+
+	rows, err := r.DB.Query(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("query wallet ledger: %w", err)
+	}
+	defer rows.Close()
+
+	entries := make([]ports.LedgerEntryView, 0, limit)
+	for rows.Next() {
+		var entry ports.LedgerEntryView
+		var amountCents, beforeCents, afterCents int64
+		var currency string
+		if err := rows.Scan(&entry.ID, &entry.WalletID, &entry.TransactionID, &entry.Direction, &amountCents, &currency, &beforeCents, &afterCents, &entry.CreatedAt); err != nil {
+			return nil, "", fmt.Errorf("scan wallet ledger: %w", err)
+		}
+		entry.Amount, err = money.FromCents(amountCents, currency)
+		if err != nil {
+			return nil, "", err
+		}
+		entry.BalanceBefore, err = money.FromCents(beforeCents, currency)
+		if err != nil {
+			return nil, "", err
+		}
+		entry.BalanceAfter, err = money.FromCents(afterCents, currency)
+		if err != nil {
+			return nil, "", err
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+
+	nextCursor := ""
+	if len(entries) > limit {
+		last := entries[limit-1]
+		entries = entries[:limit]
+		nextCursor = base64.RawURLEncoding.EncodeToString([]byte(last.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID.String()))
+	}
+	return entries, nextCursor, nil
+}
+
+func (r *WalletRepo) Reconcile(ctx context.Context, walletID uuid.UUID) (ports.ReconciliationView, error) {
+	tx, err := r.DB.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return ports.ReconciliationView{}, fmt.Errorf("begin reconciliation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var storedCents int64
+	var currency string
+	if err := tx.QueryRow(ctx, `SELECT balance_cents, currency FROM wallets WHERE id = $1`, walletID).Scan(&storedCents, &currency); err != nil {
+		return ports.ReconciliationView{}, err
+	}
+	var calculatedCents int64
+	var checkedEntries int
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(SUM(CASE WHEN direction = 'CREDIT' THEN amount_cents ELSE -amount_cents END), 0), COUNT(*)
+		FROM wallet_ledger_entries
+		WHERE wallet_id = $1
+	`, walletID).Scan(&calculatedCents, &checkedEntries); err != nil {
+		return ports.ReconciliationView{}, fmt.Errorf("calculate wallet reconciliation: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ports.ReconciliationView{}, fmt.Errorf("commit reconciliation read: %w", err)
+	}
+	stored, err := money.FromCents(storedCents, currency)
+	if err != nil {
+		return ports.ReconciliationView{}, err
+	}
+	calculated, err := money.FromCents(calculatedCents, currency)
+	if err != nil {
+		return ports.ReconciliationView{}, err
+	}
+	difference, err := stored.Subtract(calculated)
+	if err != nil {
+		return ports.ReconciliationView{}, err
+	}
+	return ports.ReconciliationView{
+		WalletID:          walletID,
+		StoredBalance:     stored,
+		CalculatedBalance: calculated,
+		Difference:        difference,
+		Consistent:        difference.IsZero(),
+		CheckedEntries:    checkedEntries,
+	}, nil
 }
 
 func (r *WalletRepo) ProcessTransaction(
@@ -824,6 +955,82 @@ func (r *WalletRepo) ProcessTransaction(
 		IdempotentReplay: false,
 		FailureCode:      failureCode,
 	}, nil
+}
+
+func (r *WalletRepo) GetTransaction(ctx context.Context, transactionID uuid.UUID) (ports.TransactionView, error) {
+	return r.getTransaction(ctx, `WHERE id = $1`, transactionID)
+}
+
+func (r *WalletRepo) GetTransactionByExternal(ctx context.Context, providerID, externalTransactionID string) (ports.TransactionView, error) {
+	return r.getTransaction(ctx, `WHERE provider_id = $1 AND external_transaction_id = $2`, providerID, externalTransactionID)
+}
+
+func (r *WalletRepo) getTransaction(ctx context.Context, predicate string, args ...any) (ports.TransactionView, error) {
+	var view ports.TransactionView
+	var providerID, externalID, idempotencyKey, roundID, gameID, failureCode, referenceExternalID *string
+	var referenceTransactionID *uuid.UUID
+	var resultBalanceCents *int64
+	var resultWalletVersion *int64
+	var processedAt *time.Time
+	var amountCents int64
+	var currency string
+	err := r.DB.QueryRow(ctx, `
+		SELECT id, provider_id, external_transaction_id, idempotency_key,
+		       player_id, wallet_id, round_id, game_id, kind, status,
+		       amount_cents, currency, failure_code,
+		       reference_external_transaction_id, reference_transaction_id,
+		       result_balance_cents, result_wallet_version,
+		       created_at, updated_at, processed_at
+		FROM wager_transactions `+predicate, args...).Scan(
+		&view.ID, &providerID, &externalID, &idempotencyKey,
+		&view.PlayerID, &view.WalletID, &roundID, &gameID, &view.Kind, &view.Status,
+		&amountCents, &currency, &failureCode,
+		&referenceExternalID, &referenceTransactionID,
+		&resultBalanceCents, &resultWalletVersion,
+		&view.CreatedAt, &view.UpdatedAt, &processedAt,
+	)
+	if err != nil {
+		return ports.TransactionView{}, err
+	}
+	if providerID != nil {
+		view.ProviderID = *providerID
+	}
+	if externalID != nil {
+		view.ExternalTransactionID = *externalID
+	}
+	if idempotencyKey != nil {
+		view.IdempotencyKey = *idempotencyKey
+	}
+	if roundID != nil {
+		view.RoundID = *roundID
+	}
+	if gameID != nil {
+		view.GameID = *gameID
+	}
+	if failureCode != nil {
+		view.FailureCode = *failureCode
+	}
+	if referenceExternalID != nil {
+		view.ReferenceExternalID = *referenceExternalID
+	}
+	if referenceTransactionID != nil {
+		view.ReferenceTransactionID = *referenceTransactionID
+	}
+	view.Amount, err = money.FromCents(amountCents, currency)
+	if err != nil {
+		return ports.TransactionView{}, err
+	}
+	if resultBalanceCents != nil {
+		view.ResultBalance, err = money.FromCents(*resultBalanceCents, currency)
+		if err != nil {
+			return ports.TransactionView{}, err
+		}
+	}
+	if resultWalletVersion != nil {
+		view.ResultWalletVersion = *resultWalletVersion
+	}
+	view.ProcessedAt = processedAt
+	return view, nil
 }
 
 // RetryPendingReference advances retry metadata for a pending reversal whose

@@ -58,6 +58,7 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 	}
 
 	cfg := recoverySQSConfig()
+	commandMessageID := "command-" + uuid.New().String()
 
 	sqsClient, err := sqsInfra.NewClient(cfg)
 	if err != nil {
@@ -67,7 +68,9 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 	transactionQueueURL := createRecoveryTestQueue(t, cfg)
 
 	message := messaging.WagerTransactionRequested{
-		Type: "WagerTransactionRequested",
+		MessageID:  commandMessageID,
+		Type:       "WagerTransactionRequested",
+		OccurredAt: time.Now().UTC(),
 		Data: messaging.WagerTransactionData{
 			ProviderID:            providerID,
 			ExternalTransactionID: externalTransactionID,
@@ -107,7 +110,7 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
              WHERE consumer_name = $1
                AND message_id = $2`,
 			"transaction-consumer",
-			messageID,
+			commandMessageID,
 		)
 
 		_, _ = pool.Exec(
@@ -269,7 +272,7 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
           AND message_id = $2
         `,
 		"transaction-consumer",
-		messageID,
+		commandMessageID,
 	).Scan(&inboxCompleted); err != nil {
 		firstCancel()
 		_ = firstConsumer.Stop(context.Background())

@@ -188,7 +188,7 @@ func (c *QueueConsumer) processCommand(ctx context.Context, message ports.QueueM
 		return fmt.Errorf("begin transaction command: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	duplicate, err := c.inbox.Process(txCtx, c.cfg.Name, message.MessageID, []byte(message.Body), func(effectCtx context.Context, _ []byte) error {
+	duplicate, err := c.inbox.Process(txCtx, c.cfg.Name, command.MessageID, []byte(message.Body), func(effectCtx context.Context, _ []byte) error {
 		_, err := c.wagering.ProcessTransaction(effectCtx, command.Data.IdempotencyKey, ports.WageringRequest{
 			ProviderID:                     command.Data.ProviderID,
 			ExternalTransactionID:          command.Data.ExternalTransactionID,

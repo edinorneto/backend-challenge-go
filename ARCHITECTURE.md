@@ -97,6 +97,17 @@ restart, and multiple instances can process different pending rows safely.
 The Inbox is the durable protection against duplicate delivery and does not
 rely on SQS deduplication alone.
 
+Command envelopes carry a durable `messageId`, `type`, `occurredAt` and `data`.
+The command `messageId` is used as the Inbox key, while the nested
+`idempotencyKey` remains the identity of the financial operation. A message is
+deleted from SQS only after the Inbox, financial state and Outbox changes have
+committed.
+
+Wallet ledger reads use keyset pagination ordered by `(created_at, id)` and do
+not use SQL offsets. Reconciliation runs in a read transaction, sums credits
+and debits including the opening entry, reports the difference from the stored
+wallet balance, and never mutates the wallet or ledger.
+
 The application can run as multiple independent Compose instances. Each
 instance has its own memory, connection pool, consumers, publisher, and
 pending-reference worker, while financial state is shared through PostgreSQL

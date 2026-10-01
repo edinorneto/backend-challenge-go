@@ -93,6 +93,14 @@ func (s *WageringService) ProcessTransaction(
 	})
 }
 
+func (s *WageringService) GetTransaction(ctx context.Context, transactionID uuid.UUID) (ports.TransactionView, error) {
+	return s.repo.GetTransaction(ctx, transactionID)
+}
+
+func (s *WageringService) GetTransactionByExternal(ctx context.Context, providerID, externalTransactionID string) (ports.TransactionView, error) {
+	return s.repo.GetTransactionByExternal(ctx, providerID, externalTransactionID)
+}
+
 func computePayloadHash(
 	providerID string,
 	externalTransactionID string,

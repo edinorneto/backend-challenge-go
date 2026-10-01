@@ -30,11 +30,25 @@ func (r *authTestWageringRepo) RetryPendingReference(context.Context, uuid.UUID)
 	return ports.ProcessTransactionResult{}, nil
 }
 
+func (r *authTestWageringRepo) GetTransaction(context.Context, uuid.UUID) (ports.TransactionView, error) {
+	return ports.TransactionView{}, nil
+}
+
+func (r *authTestWageringRepo) GetTransactionByExternal(context.Context, string, string) (ports.TransactionView, error) {
+	return ports.TransactionView{}, nil
+}
+
 type authTestWalletRepo struct{}
 
 func (authTestWalletRepo) Create(context.Context, *wallet.Wallet) error { return nil }
 func (authTestWalletRepo) Get(context.Context, uuid.UUID) (*wallet.Wallet, error) {
 	return nil, nil
+}
+func (authTestWalletRepo) GetLedger(context.Context, uuid.UUID, string, int) ([]ports.LedgerEntryView, string, error) {
+	return nil, "", nil
+}
+func (authTestWalletRepo) Reconcile(context.Context, uuid.UUID) (ports.ReconciliationView, error) {
+	return ports.ReconciliationView{}, nil
 }
 
 func TestWageringUsesAuthenticatedProviderInsteadOfBody(t *testing.T) {

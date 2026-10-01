@@ -49,3 +49,11 @@ func (s *WalletService) GetWallet(
 ) (*wallet.Wallet, error) {
 	return s.repo.Get(ctx, id)
 }
+
+func (s *WalletService) GetLedger(ctx context.Context, walletID uuid.UUID, cursor string, limit int) ([]ports.LedgerEntryView, string, error) {
+	return s.repo.GetLedger(ctx, walletID, cursor, limit)
+}
+
+func (s *WalletService) Reconcile(ctx context.Context, walletID uuid.UUID) (ports.ReconciliationView, error) {
+	return s.repo.Reconcile(ctx, walletID)
+}
