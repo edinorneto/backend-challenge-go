@@ -198,6 +198,107 @@ func TestProcessTransactionConcurrentSameIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestProcessTransactionFiftyConcurrentDuplicateBets(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+	request := testRequest(
+		playerID,
+		walletID,
+		"transaction-fifty-duplicates",
+		"key-fifty-duplicates",
+		"hash-fifty-duplicates",
+		testMoney(t, "25.00"),
+	)
+
+	const duplicateCount = 50
+	results := make([]ports.ProcessTransactionResult, duplicateCount)
+	errs := make([]error, duplicateCount)
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	group.Add(duplicateCount)
+	for index := range results {
+		go func(index int) {
+			defer group.Done()
+			<-start
+			results[index], errs[index] = repo.ProcessTransaction(context.Background(), request)
+		}(index)
+	}
+	close(start)
+	group.Wait()
+
+	var transactionID uuid.UUID
+	replayCount := 0
+	for index, err := range errs {
+		if err != nil {
+			t.Fatalf("duplicate request %d failed: %v", index, err)
+		}
+		if results[index].Status != "PROCESSED" {
+			t.Fatalf("duplicate request %d returned status %s", index, results[index].Status)
+		}
+		if transactionID == uuid.Nil {
+			transactionID = results[index].TransactionID
+		}
+		if results[index].TransactionID != transactionID {
+			t.Fatalf("duplicate request %d returned transaction %s, expected %s", index, results[index].TransactionID, transactionID)
+		}
+		if results[index].IdempotentReplay {
+			replayCount++
+		}
+		if results[index].Balance.String() != "75.00" {
+			t.Fatalf("duplicate request %d returned balance %s, expected 75.00", index, results[index].Balance)
+		}
+	}
+	if replayCount != duplicateCount-1 {
+		t.Fatalf("expected %d idempotent replays, got %d", duplicateCount-1, replayCount)
+	}
+
+	var transactionCount int
+	if err := pool.QueryRow(
+		context.Background(),
+		`SELECT COUNT(*) FROM wager_transactions
+		 WHERE provider_id = $1 AND external_transaction_id = $2 AND idempotency_key = $3 AND payload_hash = $4`,
+		request.ProviderID,
+		request.ExternalTransactionID,
+		request.IdempotencyKey,
+		request.PayloadHash,
+	).Scan(&transactionCount); err != nil {
+		t.Fatal(err)
+	}
+	if transactionCount != 1 {
+		t.Fatalf("expected one wager transaction, got %d", transactionCount)
+	}
+
+	var ledgerCount int
+	if err := pool.QueryRow(
+		context.Background(),
+		`SELECT COUNT(*) FROM wallet_ledger_entries
+		 WHERE wallet_id = $1 AND direction = 'DEBIT' AND transaction_id = $2`,
+		walletID,
+		transactionID,
+	).Scan(&ledgerCount); err != nil {
+		t.Fatal(err)
+	}
+	if ledgerCount != 1 {
+		t.Fatalf("expected one debit ledger entry, got %d", ledgerCount)
+	}
+
+	var balanceCents int64
+	if err := pool.QueryRow(
+		context.Background(),
+		`SELECT balance_cents FROM wallets WHERE id = $1`,
+		walletID,
+	).Scan(&balanceCents); err != nil {
+		t.Fatal(err)
+	}
+	if balanceCents != 7500 {
+		t.Fatalf("expected wallet balance 75.00, got %d cents", balanceCents)
+	}
+	if balanceCents < 0 {
+		t.Fatalf("wallet balance must not be negative, got %d cents", balanceCents)
+	}
+}
+
 func TestProcessTransactionConcurrentBetsLockOneWallet(t *testing.T) {
 	pool := testPool(t)
 	repo := database.NewWalletRepo(pool)
@@ -247,6 +348,78 @@ func TestProcessTransactionConcurrentBetsLockOneWallet(t *testing.T) {
 	}
 	if balanceCents != 2000 {
 		t.Fatalf("expected final balance 20.00, got %d cents", balanceCents)
+	}
+}
+
+func TestProcessTransactionConcurrentBetsDifferentWallets(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	playerOneID, walletOneID := createTestWallet(t, repo, pool, "100.00")
+	playerTwoID, walletTwoID := createTestWallet(t, repo, pool, "100.00")
+	amount := testMoney(t, "25.00")
+
+	requests := []ports.ProcessTransactionRequest{
+		testRequest(playerOneID, walletOneID, "transaction-wallet-one", "key-wallet-one", "hash-wallet-one", amount),
+		testRequest(playerTwoID, walletTwoID, "transaction-wallet-two", "key-wallet-two", "hash-wallet-two", amount),
+	}
+	results := make([]ports.ProcessTransactionResult, len(requests))
+	errs := make([]error, len(requests))
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	group.Add(len(requests))
+	for index := range requests {
+		go func(index int) {
+			defer group.Done()
+			<-start
+			results[index], errs[index] = repo.ProcessTransaction(context.Background(), requests[index])
+		}(index)
+	}
+	close(start)
+	group.Wait()
+
+	for index, result := range results {
+		if errs[index] != nil {
+			t.Fatalf("wallet %d operation failed: %v", index+1, errs[index])
+		}
+		if result.Status != "PROCESSED" {
+			t.Fatalf("wallet %d operation returned status %s", index+1, result.Status)
+		}
+		if result.IdempotentReplay {
+			t.Fatalf("wallet %d operation was unexpectedly treated as an idempotent replay", index+1)
+		}
+		if result.Balance.String() != "75.00" {
+			t.Fatalf("wallet %d operation returned balance %s, expected 75.00", index+1, result.Balance)
+		}
+	}
+
+	for index, walletID := range []uuid.UUID{walletOneID, walletTwoID} {
+		var balanceCents int64
+		if err := pool.QueryRow(
+			context.Background(),
+			`SELECT balance_cents FROM wallets WHERE id = $1`,
+			walletID,
+		).Scan(&balanceCents); err != nil {
+			t.Fatalf("wallet %d balance query failed: %v", index+1, err)
+		}
+		if balanceCents != 7500 {
+			t.Fatalf("wallet %d expected final balance 75.00, got %d cents", index+1, balanceCents)
+		}
+		if balanceCents < 0 {
+			t.Fatalf("wallet %d balance must not be negative, got %d cents", index+1, balanceCents)
+		}
+
+		var ledgerCount int
+		if err := pool.QueryRow(
+			context.Background(),
+			`SELECT COUNT(*) FROM wallet_ledger_entries
+			 WHERE wallet_id = $1 AND direction = 'DEBIT'`,
+			walletID,
+		).Scan(&ledgerCount); err != nil {
+			t.Fatalf("wallet %d ledger query failed: %v", index+1, err)
+		}
+		if ledgerCount != 1 {
+			t.Fatalf("wallet %d expected one debit ledger entry, got %d", index+1, ledgerCount)
+		}
 	}
 }
 

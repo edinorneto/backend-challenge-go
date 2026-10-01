@@ -345,6 +345,208 @@ func TestOutboxRepositoryClaimsConcurrentEventsOnce(t *testing.T) {
 	}
 }
 
+func TestTwoOutboxPublishersPublishConcurrentEventsOnce(t *testing.T) {
+	ctx := context.Background()
+	pool, cleanupPool := isolatedOutboxPool(t)
+	t.Cleanup(cleanupPool)
+	walletRepo := database.NewWalletRepo(pool)
+	outboxRepo := database.NewOutboxRepo(pool)
+
+	const operationCount = 3
+	correlationIDs := make([]uuid.UUID, 0, operationCount)
+	for index := 0; index < operationCount; index++ {
+		playerID := uuid.New()
+		walletID := uuid.New()
+		testWallet, err := wallet.New(walletID, playerID, mustMoney(t, "100.00"), time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := walletRepo.Create(ctx, testWallet); err != nil {
+			t.Fatal(err)
+		}
+
+		result, err := walletRepo.ProcessTransaction(ctx, ports.ProcessTransactionRequest{
+			ProviderID:            "provider-publishers-" + walletID.String(),
+			ExternalTransactionID: "publishers-" + uuid.New().String(),
+			IdempotencyKey:        "publishers-idem-" + uuid.New().String(),
+			PayloadHash:           "publishers-payload-" + uuid.New().String(),
+			PlayerID:              playerID,
+			WalletID:              walletID,
+			RoundID:               "publishers-round-" + uuid.New().String(),
+			GameID:                "publishers-game",
+			Kind:                  "BET",
+			Amount:                mustMoney(t, "10.00"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		correlationIDs = append(correlationIDs, result.TransactionID)
+	}
+
+	expectedEventIDs := make(map[uuid.UUID]struct{})
+	for _, correlationID := range correlationIDs {
+		rows, err := pool.Query(ctx, `
+			SELECT event_id
+			FROM outbox_events
+			WHERE correlation_id = $1
+		`, correlationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var eventID uuid.UUID
+			if err := rows.Scan(&eventID); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			expectedEventIDs[eventID] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		rows.Close()
+	}
+	if len(expectedEventIDs) != operationCount*2 {
+		t.Fatalf("expected %d test outbox events, got %d", operationCount*2, len(expectedEventIDs))
+	}
+
+	cfg := recoverySQSConfig()
+	sqsClient, err := sqsInfra.NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queueManager := sqsInfra.NewQueueManager(sqsClient, cfg)
+	if _, err := queueManager.Resolve(ctx); err != nil {
+		t.Skipf("LocalStack/SQS unavailable: %v", err)
+	}
+	eventQueueURL := createOutboxTestQueue(t, cfg)
+
+	publisherOne, err := sqsInfra.NewPublisher(sqsClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisherOne.ConfigureQueueURL(eventQueueURL); err != nil {
+		t.Fatal(err)
+	}
+	publisherTwo, err := sqsInfra.NewPublisher(sqsClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisherTwo.ConfigureQueueURL(eventQueueURL); err != nil {
+		t.Fatal(err)
+	}
+
+	recordingOne := &recordingPublisher{inner: publisherOne}
+	recordingTwo := &recordingPublisher{inner: publisherTwo}
+	publisherConfig := config.Config{
+		OutboxBatchSize:      operationCount,
+		OutboxLeaseDuration:  30 * time.Second,
+		OutboxRetryBaseDelay: 100 * time.Millisecond,
+	}
+	workerOne := NewOutboxPublisher(outboxRepo, recordingOne, publisherConfig)
+	workerTwo := NewOutboxPublisher(outboxRepo, recordingTwo, publisherConfig)
+
+	start := make(chan struct{})
+	errorsCh := make(chan error, 2)
+	var group sync.WaitGroup
+	for _, worker := range []*OutboxPublisher{workerOne, workerTwo} {
+		worker := worker
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			errorsCh <- worker.publishPending(ctx)
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var pendingCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM outbox_events
+		WHERE event_id = ANY($1) AND status = 'PENDING'
+	`, uuidSlice(expectedEventIDs)).Scan(&pendingCount); err != nil {
+		t.Fatal(err)
+	}
+	if pendingCount != 0 {
+		t.Fatalf("expected no pending test events, got %d", pendingCount)
+	}
+
+	var publishedCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM outbox_events
+		WHERE event_id = ANY($1) AND status = 'PUBLISHED'
+	`, uuidSlice(expectedEventIDs)).Scan(&publishedCount); err != nil {
+		t.Fatal(err)
+	}
+	if publishedCount != len(expectedEventIDs) {
+		t.Fatalf("expected all %d test events to be published, got %d", len(expectedEventIDs), publishedCount)
+	}
+
+	recorded := make(map[uuid.UUID]ports.OutboxMessage, len(expectedEventIDs))
+	for _, message := range append(recordingOne.messages, recordingTwo.messages...) {
+		var envelope messaging.EventEnvelope
+		if err := json.Unmarshal([]byte(message.Body), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := expectedEventIDs[envelope.EventID]; !ok {
+			t.Fatalf("publisher sent unrelated event %s", envelope.EventID)
+		}
+		if message.MessageDeduplicationID != envelope.EventID.String() {
+			t.Fatalf("event %s used deduplication ID %s", envelope.EventID, message.MessageDeduplicationID)
+		}
+		if _, exists := recorded[envelope.EventID]; exists {
+			t.Fatalf("event %s was published by both publishers", envelope.EventID)
+		}
+		recorded[envelope.EventID] = message
+	}
+	if len(recorded) != len(expectedEventIDs) {
+		t.Fatalf("expected one recorded publish for each of %d events, got %d", len(expectedEventIDs), len(recorded))
+	}
+
+	consumer, err := sqsInfra.NewConsumer(sqsClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.ConfigureQueueURL(eventQueueURL); err != nil {
+		t.Fatal(err)
+	}
+	receiveCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	received := make(map[uuid.UUID]struct{}, len(expectedEventIDs))
+	for len(received) < len(expectedEventIDs) {
+		messages, err := consumer.Receive(receiveCtx, 10, 1, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, message := range messages {
+			var envelope messaging.EventEnvelope
+			if err := json.Unmarshal([]byte(message.Body), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := expectedEventIDs[envelope.EventID]; !ok {
+				t.Fatalf("queue received unrelated event %s", envelope.EventID)
+			}
+			if _, exists := received[envelope.EventID]; exists {
+				t.Fatalf("queue delivered event %s more than once", envelope.EventID)
+			}
+			received[envelope.EventID] = struct{}{}
+			if err := consumer.Delete(ctx, message.ReceiptHandle); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
 type publishThenBlockPublisher struct {
 	inner     ports.OutboxMessagePublisher
 	published chan ports.OutboxMessage
@@ -379,6 +581,14 @@ func mustMoney(t *testing.T, amount string) money.Money {
 		t.Fatal(err)
 	}
 	return value
+}
+
+func uuidSlice(values map[uuid.UUID]struct{}) []uuid.UUID {
+	result := make([]uuid.UUID, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	return result
 }
 
 func createOutboxTestQueue(t *testing.T, cfg config.Config) string {
