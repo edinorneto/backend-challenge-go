@@ -27,7 +27,11 @@ the request context. Wagering derives `provider_id` exclusively from the
 configured provider claim, so a body field cannot switch providers. Wallet
 creation and reads require the `wallet-internal` role and are restricted to
 the `backend-internal` service account; provider users do not receive wallet
-roles. Liveness remains public. The application domain and
+roles. The public `/health/live` endpoint reports process liveness. The public
+`/health/ready` endpoint checks PostgreSQL and SQS readiness, returning `200`
+with `{"status":"ready"}` when both are available and `503` with
+`{"status":"not_ready","checks":{"postgres":"ok|error","sqs":"ok|error"}}`
+when either dependency is unavailable. The application domain and
 `WageringService` do not depend on the OIDC library.
 
 The publisher is implemented as a separate application worker. It claims a small

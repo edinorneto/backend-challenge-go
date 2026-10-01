@@ -1,31 +1,53 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/edinorneto/backend-challenge-go/internal/application"
 	"github.com/edinorneto/backend-challenge-go/internal/auth"
 	"github.com/edinorneto/backend-challenge-go/internal/domain/money"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database"
+	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/sqs"
 )
+
+type postgresHealthChecker interface {
+	Ping(context.Context) error
+}
+
+type sqsHealthChecker interface {
+	Check(context.Context) error
+}
 
 type Server struct {
 	wallets  *application.WalletService
 	wagering *application.WageringService
 	auth     *auth.Middleware
+	postgres postgresHealthChecker
+	sqs      sqsHealthChecker
 }
 
-func NewServer(wallets *application.WalletService, wagering *application.WageringService, middleware *auth.Middleware) *Server {
+func NewServer(
+	wallets *application.WalletService,
+	wagering *application.WageringService,
+	middleware *auth.Middleware,
+	pool *pgxpool.Pool,
+	queueManager *sqs.QueueManager,
+) *Server {
 	return &Server{
 		wallets:  wallets,
 		wagering: wagering,
 		auth:     middleware,
+		postgres: pool,
+		sqs:      queueManager,
 	}
 }
 
@@ -33,6 +55,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health/live", s.liveHandler)
+	mux.HandleFunc("/health/ready", s.readyHandler)
 	mux.Handle("POST /wallets", s.auth.Require(http.HandlerFunc(s.walletsHandler), "wallet-internal"))
 	mux.Handle("GET /wallets/{walletID}", s.auth.Require(http.HandlerFunc(s.getWalletHandler), "wallet-internal"))
 	mux.Handle("POST /wagering/transactions", s.auth.Require(http.HandlerFunc(s.wageringHandler)))
@@ -47,6 +70,39 @@ func (s *Server) liveHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) readyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	postgresStatus := "ok"
+	if s.postgres == nil || s.postgres.Ping(ctx) != nil {
+		postgresStatus = "error"
+	}
+
+	sqsStatus := "ok"
+	if s.sqs == nil || s.sqs.Check(ctx) != nil {
+		sqsStatus = "error"
+	}
+
+	if postgresStatus == "error" || sqsStatus == "error" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "not_ready",
+			"checks": map[string]string{
+				"postgres": postgresStatus,
+				"sqs":      sqsStatus,
+			},
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 func (s *Server) walletsHandler(w http.ResponseWriter, r *http.Request) {
