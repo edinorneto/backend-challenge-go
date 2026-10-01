@@ -835,6 +835,55 @@ func (r *WalletRepo) RetryPendingReference(ctx context.Context, transactionID uu
 	}
 	defer tx.Rollback(ctx)
 
+	result, err := r.retryPendingReferenceTx(ctx, tx, transactionID)
+	if err != nil {
+		return ports.ProcessTransactionResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("commit reference retry: %w", err)
+	}
+	return result, nil
+}
+
+// ProcessNextPendingReference claims and processes one due pending reference
+// while retaining the row lock for the whole transaction.
+func (r *WalletRepo) ProcessNextPendingReference(ctx context.Context) (bool, error) {
+	tx, err := r.DB.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin pending reference worker transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var transactionID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		SELECT id
+		FROM wager_transactions
+		WHERE status = 'PENDING_REFERENCE'
+		  AND reference_next_attempt_at <= NOW()
+		ORDER BY reference_next_attempt_at, id
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	`).Scan(&transactionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("commit idle pending reference worker transaction: %w", err)
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("claim pending reference: %w", err)
+	}
+
+	if _, err := r.retryPendingReferenceTx(ctx, tx, transactionID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit pending reference worker transaction: %w", err)
+	}
+	return true, nil
+}
+
+func (r *WalletRepo) retryPendingReferenceTx(ctx context.Context, tx pgx.Tx, transactionID uuid.UUID) (ports.ProcessTransactionResult, error) {
 	var req struct {
 		providerID          string
 		externalID          string
@@ -852,7 +901,7 @@ func (r *WalletRepo) RetryPendingReference(ctx context.Context, transactionID uu
 		attempts            int
 		balanceCents        int64
 	}
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT provider_id, external_transaction_id, idempotency_key, payload_hash,
 		       player_id, wallet_id, round_id, game_id, kind, amount_cents, currency,
 		       reference_external_transaction_id, status, reference_attempts,
@@ -877,9 +926,6 @@ func (r *WalletRepo) RetryPendingReference(ctx context.Context, transactionID uu
 		if err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("rehydrate retry result: %w", err)
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return ports.ProcessTransactionResult{}, fmt.Errorf("commit reference retry result: %w", err)
-		}
 		return ports.ProcessTransactionResult{TransactionID: transactionID, Status: req.status, Balance: balance}, nil
 	}
 
@@ -902,9 +948,6 @@ func (r *WalletRepo) RetryPendingReference(ctx context.Context, transactionID uu
 		result, err := persistReferenceRetry(ctx, tx, transactionID, req.walletID, req.providerID, req.kind, req.referenceExternalID, req.attempts, req.balanceCents, req.currency)
 		if err != nil {
 			return ports.ProcessTransactionResult{}, err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return ports.ProcessTransactionResult{}, fmt.Errorf("commit reference retry: %w", err)
 		}
 		return result, nil
 	}
@@ -987,9 +1030,6 @@ func (r *WalletRepo) RetryPendingReference(ctx context.Context, transactionID uu
 		if err := insertOutboxEvent(ctx, tx, now, transactionID, req.walletID, messaging.NewWagerTransactionRejected(buildRejectedPayload(transactionID, reversalReq, failureCode, walletBalance, walletRow.version))); err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("insert retried rejection event: %w", err)
 		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return ports.ProcessTransactionResult{}, fmt.Errorf("commit resolved reference retry: %w", err)
 	}
 	return ports.ProcessTransactionResult{TransactionID: transactionID, Status: status, Balance: resultBalance, FailureCode: failureCode}, nil
 }

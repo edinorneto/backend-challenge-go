@@ -61,6 +61,10 @@ type WageringRepository interface {
 	) (ProcessTransactionResult, error)
 }
 
+type PendingReferenceRepository interface {
+	ProcessNextPendingReference(ctx context.Context) (bool, error)
+}
+
 type Transaction interface {
 	Commit(ctx context.Context) error
 	Rollback(ctx context.Context) error

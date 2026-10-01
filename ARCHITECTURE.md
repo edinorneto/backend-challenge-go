@@ -81,6 +81,14 @@ event SQS FIFO queue. These events are never interpreted as input commands.
 Failed processing leaves command messages available for redelivery and the
 existing SQS redrive policy remains responsible for the DLQ.
 
-Retry workers for `PENDING_REFERENCE`, authentication, metrics, and
-reconciliation remain outside this stage. The Inbox is the durable protection
-against duplicate delivery and does not rely on SQS deduplication alone.
+The application also runs a pending-reference worker for
+`PENDING_REFERENCE`. It polls due rows from `wager_transactions`, claims one
+row with `FOR UPDATE SKIP LOCKED`, and keeps that lock while the existing
+reference retry transaction completes. The persisted
+`reference_next_attempt_at` and `reference_attempts` values continue to control
+exponential backoff and the existing attempt limit. Because the pending state
+is stored in PostgreSQL, a new application instance can recover it after a
+restart, and multiple instances can process different pending rows safely.
+
+The Inbox is the durable protection against duplicate delivery and does not
+rely on SQS deduplication alone.

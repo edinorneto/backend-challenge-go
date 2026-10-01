@@ -51,6 +51,9 @@ func main() {
 			application.NewWalletService,
 			application.NewWageringService,
 			application.NewOutboxPublisher,
+			func(repo *database.WalletRepo, cfg config.Config) *application.ReferenceWorker {
+				return application.NewReferenceWorker(repo, cfg)
+			},
 			func(receiver *sqs.Consumer, inbox ports.InboxRepository, wagering *application.WageringService, txManager *database.TransactionManager) *application.QueueConsumer {
 				return application.NewFinancialQueueConsumer(receiver, inbox, wagering, txManager, application.QueueConsumerConfig{
 					Name:                  "transaction-consumer",
@@ -77,6 +80,7 @@ func startMessaging(
 	sqsPublisher *sqs.Publisher,
 	receiver *sqs.Consumer,
 	publisher *application.OutboxPublisher,
+	referenceWorker *application.ReferenceWorker,
 	consumer *application.QueueConsumer,
 ) {
 	lc.Append(fx.Hook{
@@ -94,17 +98,31 @@ func startMessaging(
 			if err := publisher.Start(context.Background()); err != nil {
 				return err
 			}
+			if err := referenceWorker.Start(context.Background()); err != nil {
+				_ = publisher.Stop(ctx)
+				return err
+			}
 			if err := consumer.Start(context.Background()); err != nil {
+				_ = referenceWorker.Stop(ctx)
 				_ = publisher.Stop(ctx)
 				return err
 			}
 			return nil
 		},
 		OnStop: func(ctx context.Context) error {
+			var stopErr error
 			if err := consumer.Stop(ctx); err != nil {
-				return err
+				stopErr = err
 			}
-			return publisher.Stop(ctx)
+			if err := referenceWorker.Stop(ctx); err != nil {
+				if stopErr == nil {
+					stopErr = err
+				}
+			}
+			if err := publisher.Stop(ctx); err != nil && stopErr == nil {
+				stopErr = err
+			}
+			return stopErr
 		},
 	})
 }

@@ -341,6 +341,169 @@ func TestProcessTransactionPendingReferencePersistsRetryState(t *testing.T) {
 	}
 }
 
+func TestProcessNextPendingReferenceProcessesOnlyDueRows(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+	amount := testMoney(t, "25.00")
+
+	request := testRequest(playerID, walletID, "worker-due-reference", "worker-due-key", "worker-due-hash", amount)
+	request.Kind = "REFUND"
+	request.ReferenceExternalTransactionID = "worker-due-missing"
+	pending, err := repo.ProcessTransaction(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE wager_transactions
+		SET reference_next_attempt_at = NOW() + INTERVAL '1 hour'
+		WHERE status = 'PENDING_REFERENCE' AND id <> $1
+	`, pending.TransactionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE wager_transactions
+		SET reference_next_attempt_at = NOW() + INTERVAL '1 hour'
+		WHERE id = $1
+	`, pending.TransactionID); err != nil {
+		t.Fatal(err)
+	}
+	processed, err := repo.ProcessNextPendingReference(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed {
+		t.Fatal("worker processed a reference before next_attempt_at")
+	}
+
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE wager_transactions
+		SET reference_next_attempt_at = NOW() - INTERVAL '1 second'
+		WHERE id = $1
+	`, pending.TransactionID); err != nil {
+		t.Fatal(err)
+	}
+	processed, err = repo.ProcessNextPendingReference(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !processed {
+		t.Fatal("worker did not process a due pending reference")
+	}
+
+	var attempts int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT reference_attempts FROM wager_transactions WHERE id = $1
+	`, pending.TransactionID).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected retry attempt 2, got %d", attempts)
+	}
+}
+
+func TestProcessNextPendingReferenceClaimsOnceAcrossConcurrentWorkers(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+	amount := testMoney(t, "25.00")
+
+	request := testRequest(playerID, walletID, "worker-concurrent-reference", "worker-concurrent-key", "worker-concurrent-hash", amount)
+	request.Kind = "REFUND"
+	request.ReferenceExternalTransactionID = "worker-concurrent-missing"
+	pending, err := repo.ProcessTransaction(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE wager_transactions
+		SET reference_next_attempt_at = NOW() + INTERVAL '1 hour'
+		WHERE status = 'PENDING_REFERENCE' AND id <> $1
+	`, pending.TransactionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE wager_transactions
+		SET reference_next_attempt_at = NOW() - INTERVAL '1 second'
+		WHERE id = $1
+	`, pending.TransactionID); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan bool, 2)
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			processed, err := repo.ProcessNextPendingReference(context.Background())
+			results <- processed
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	processedCount := 0
+	for processed := range results {
+		if processed {
+			processedCount++
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if processedCount != 1 {
+		t.Fatalf("expected one worker to claim the pending reference, got %d", processedCount)
+	}
+}
+
+func TestProcessNextPendingReferenceRecoversPersistedRow(t *testing.T) {
+	pool := testPool(t)
+	firstRepo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, firstRepo, pool, "100.00")
+	amount := testMoney(t, "25.00")
+
+	request := testRequest(playerID, walletID, "worker-restart-reference", "worker-restart-key", "worker-restart-hash", amount)
+	request.Kind = "REFUND"
+	request.ReferenceExternalTransactionID = "worker-restart-missing"
+	pending, err := firstRepo.ProcessTransaction(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE wager_transactions
+		SET reference_next_attempt_at = NOW() - INTERVAL '1 second'
+		WHERE id = $1
+	`, pending.TransactionID); err != nil {
+		t.Fatal(err)
+	}
+
+	restartedRepo := database.NewWalletRepo(pool)
+	processed, err := restartedRepo.ProcessNextPendingReference(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !processed {
+		t.Fatal("new repository instance did not recover the persisted pending reference")
+	}
+
+	var attempts int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT reference_attempts FROM wager_transactions WHERE id = $1
+	`, pending.TransactionID).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected recovered retry attempt 2, got %d", attempts)
+	}
+}
+
 func TestRetryPendingReferenceProcessesExistingBet(t *testing.T) {
 	pool := testPool(t)
 	repo := database.NewWalletRepo(pool)
