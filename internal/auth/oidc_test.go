@@ -87,6 +87,39 @@ func TestVerifierAcceptsValidToken(t *testing.T) {
 	}
 }
 
+func TestMiddlewareRejectsMissingSubject(t *testing.T) {
+	server := newOIDCTestServer(t)
+	claims := jwt.MapClaims{
+		"iss":         server.server.URL,
+		"aud":         "backend-api",
+		"exp":         time.Now().Add(time.Hour).Unix(),
+		"iat":         time.Now().Add(-time.Minute).Unix(),
+		"provider_id": "provider-a",
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token.Header["kid"] = "test-key"
+	signed, err := token.SignedString(server.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewMiddleware(server.verifier(t)).Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("Authorization", "Bearer "+signed)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", response.Code)
+	}
+	if strings.TrimSpace(response.Body.String()) != `{"error":"invalid_token"}` {
+		t.Fatalf("expected invalid_token response, got %q", response.Body.String())
+	}
+}
+
 func TestVerifierRejectsExpiredToken(t *testing.T) {
 	server := newOIDCTestServer(t)
 	token := server.token(t, "provider-a", time.Now().Add(-time.Minute), server.server.URL, server.key)
