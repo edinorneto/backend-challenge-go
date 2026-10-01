@@ -237,7 +237,8 @@ func TestOutboxPublisherRecoversAfterPublishBeforeMarkPublished(t *testing.T) {
 
 func TestOutboxRepositoryClaimsConcurrentEventsOnce(t *testing.T) {
 	ctx := context.Background()
-	pool := integrationRecoveryPool(t)
+	pool, cleanupPool := isolatedOutboxPool(t)
+	t.Cleanup(cleanupPool)
 	walletRepo := database.NewWalletRepo(pool)
 	outboxRepo := database.NewOutboxRepo(pool)
 
