@@ -57,6 +57,25 @@ Stop the environment:
 docker compose down
 ```
 
+## Observability
+
+The API emits one JSON log entry per HTTP request and structured JSON entries
+for consumer, outbox, and reference-worker transitions. Entries include UTC
+timestamps, level, event message, duration when applicable, and only the
+identifiers available to that flow (`correlationId`, `messageId`,
+`transactionId`, `walletId`, `providerId`, or `eventId`). The incoming
+`Correlation-ID` is preserved and returned; requests without one receive a
+generated value.
+
+Authorization headers, JWTs, client secrets, AWS credentials, passwords,
+access tokens, and complete financial payloads are never logged.
+
+`GET /metrics` is a public Prometheus-compatible technical endpoint. Counters
+cover operation results, Inbox duplicates, retries, consumer failures, outbox
+claims/publications/failures, reconciliation executions and divergences.
+Request and outbox timing are exported as summaries. Metrics use fixed names
+without individual IDs as labels, preventing unbounded cardinality.
+
 ## Outbox publisher
 
 This version implements the transactional outbox and the publisher worker. Every
@@ -108,6 +127,37 @@ Command messages use the following envelope:
 message ID. `data.idempotencyKey` protects the financial operation. Invalid
 commands are not deleted; SQS visibility and the configured redrive policy
 control retry and DLQ transfer.
+
+The consumer follows at-least-once delivery. The adapter extracts
+`ApproximateReceiveCount` from each SQS delivery and uses it to calculate a
+small exponential visibility backoff: the first failure uses the configured
+initial delay, then the delay doubles up to the configured maximum. The
+consumer calls `ChangeMessageVisibility` for that message and does not sleep
+inside the worker. The default application values are 1 second initially and
+30 seconds maximum. The queue's `maxReceiveCount` remains the source of truth
+for DLQ transfer; the application does not delete poison messages or implement
+a competing attempt limit.
+
+The consumer exposes retry and `sqs_messages_dlq_eligible_total` metrics. The
+latter is an observation based on the queue's configured receive-count value;
+the actual transfer is still performed by SQS redrive.
+
+Business rejections are persisted by the financial use case and are terminal:
+after the transaction commits, the message is deleted. Infrastructure failures,
+malformed envelopes, and invalid commands are not deleted. They are retried by
+SQS with the visibility backoff and eventually moved by the queue redrive
+policy. A SIGTERM cancels polling and waits for the consumer goroutine; an
+in-flight message is therefore left available for redelivery unless its
+durable transaction already committed and its delete completed.
+
+The Compose LocalStack setup creates a FIFO transaction queue with
+`SQS_MAX_RECEIVE_COUNT` (default `5`) and a FIFO DLQ. To observe the poison
+message flow, start the dependencies with `docker compose up -d`, then run:
+
+```powershell
+$env:DATABASE_URL='postgres://postgres:postgres@localhost:5432/betting?sslmode=disable'
+go test -tags=integration ./internal/application -run TestFinancialQueueConsumerRetriesPoisonMessageToDLQ -v -count=1
+```
 
 ## HTTP read and reconciliation endpoints
 

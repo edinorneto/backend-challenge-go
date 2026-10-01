@@ -14,11 +14,19 @@ import (
 )
 
 type fakeQueueReceiver struct {
-	mu       sync.Mutex
-	messages []ports.QueueMessage
-	deleted  []string
-	receives int
-	failOnce bool
+	mu         sync.Mutex
+	messages   []ports.QueueMessage
+	deleted    []string
+	receives   int
+	failOnce   bool
+	visibility []int
+}
+
+func (r *fakeQueueReceiver) ChangeVisibility(_ context.Context, _ string, seconds int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.visibility = append(r.visibility, seconds)
+	return nil
 }
 
 type fakeTransaction struct {
@@ -197,6 +205,49 @@ func TestQueueConsumerDoesNotDeleteOnProcessingError(t *testing.T) {
 	err := consumer.processMessage(context.Background(), ports.QueueMessage{MessageID: "m1", ReceiptHandle: "r1", Body: validBody()})
 	if err == nil || len(receiver.deleted) != 0 {
 		t.Fatalf("expected processing error without delete, err=%v deleted=%d", err, len(receiver.deleted))
+	}
+
+}
+
+func TestRetryDelayUsesReceiveCountAndCaps(t *testing.T) {
+	initial := 2 * time.Second
+	maximum := 10 * time.Second
+	tests := []struct {
+		receiveCount int
+		expected     time.Duration
+	}{
+		{0, 2 * time.Second},
+		{1, 2 * time.Second},
+		{2, 4 * time.Second},
+		{3, 8 * time.Second},
+		{4, 10 * time.Second},
+		{100, 10 * time.Second},
+	}
+	for _, test := range tests {
+		if got := retryDelay(test.receiveCount, initial, maximum); got != test.expected {
+			t.Fatalf("receive count %d: expected %s, got %s", test.receiveCount, test.expected, got)
+		}
+	}
+}
+
+func TestQueueConsumerSchedulesRetryVisibilityWithoutDeleting(t *testing.T) {
+	receiver := &fakeQueueReceiver{}
+	inbox := &fakeInboxRepository{effectErr: errors.New("transient processing failure")}
+	consumer := NewQueueConsumer(receiver, inbox, func(context.Context, []byte) error {
+		return errors.New("transient processing failure")
+	}, QueueConsumerConfig{Name: "test", RetryDelay: 2 * time.Second, RetryMaxDelay: 8 * time.Second})
+
+	err := consumer.processBatch(context.Background(), []ports.QueueMessage{
+		{MessageID: "m1", ReceiptHandle: "r1", Body: validBody(), ReceiveCount: 2},
+	})
+	if err == nil {
+		t.Fatal("expected processing failure")
+	}
+	if len(receiver.deleted) != 0 {
+		t.Fatalf("expected no delete, got %d", len(receiver.deleted))
+	}
+	if len(receiver.visibility) != 1 || receiver.visibility[0] != 4 {
+		t.Fatalf("expected visibility retry of 4 seconds, got %v", receiver.visibility)
 	}
 }
 

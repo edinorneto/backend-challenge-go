@@ -18,6 +18,7 @@ import (
 	"github.com/edinorneto/backend-challenge-go/internal/domain/money"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/sqs"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
@@ -35,6 +36,8 @@ type Server struct {
 	auth     *auth.Middleware
 	postgres postgresHealthChecker
 	sqs      sqsHealthChecker
+	logger   *observability.Logger
+	metrics  *observability.Metrics
 }
 
 func NewServer(
@@ -43,13 +46,32 @@ func NewServer(
 	middleware *auth.Middleware,
 	pool *pgxpool.Pool,
 	queueManager *sqs.QueueManager,
+	options ...any,
 ) *Server {
+	var logger *observability.Logger
+	var metrics *observability.Metrics
+	for _, option := range options {
+		switch value := option.(type) {
+		case *observability.Logger:
+			logger = value
+		case *observability.Metrics:
+			metrics = value
+		}
+	}
+	if logger == nil {
+		logger = observability.NewLogger()
+	}
+	if metrics == nil {
+		metrics = observability.NewMetrics()
+	}
 	return &Server{
 		wallets:  wallets,
 		wagering: wagering,
 		auth:     middleware,
 		postgres: pool,
 		sqs:      queueManager,
+		logger:   logger,
+		metrics:  metrics,
 	}
 }
 
@@ -58,6 +80,9 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("/health/live", s.liveHandler)
 	mux.HandleFunc("/health/ready", s.readyHandler)
+	if s.metrics != nil {
+		mux.Handle("/metrics", s.metrics.Handler())
+	}
 	mux.Handle("POST /wallets", s.auth.Require(http.HandlerFunc(s.walletsHandler), "wallet-internal"))
 	mux.Handle("GET /wallets/{walletID}", s.auth.Require(http.HandlerFunc(s.getWalletHandler), "wallet-internal"))
 	mux.Handle("GET /wallets/{walletID}/ledger", s.auth.Require(http.HandlerFunc(s.getLedgerHandler), "wallet-internal"))
@@ -66,7 +91,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /wagering/transactions/{transactionID}", s.auth.Require(http.HandlerFunc(s.getTransactionHandler)))
 	mux.Handle("GET /providers/{providerID}/wagering/transactions/{externalTransactionID}", s.auth.Require(http.HandlerFunc(s.getExternalTransactionHandler)))
 
-	return loggingMiddleware(mux)
+	return loggingMiddleware(mux, s.logger, s.metrics)
 }
 
 func (s *Server) liveHandler(w http.ResponseWriter, r *http.Request) {
@@ -192,10 +217,56 @@ func (s *Server) walletsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func loggingMiddleware(next http.Handler) http.Handler {
+func loggingMiddleware(next http.Handler, logger *observability.Logger, metrics *observability.Metrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
+		correlationID := r.Header.Get("Correlation-ID")
+		if correlationID == "" {
+			correlationID = uuid.NewString()
+		}
+		r = r.WithContext(observability.WithCorrelationID(r.Context(), correlationID))
+		w.Header().Set("Correlation-ID", correlationID)
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(recorder, r)
+		if metrics != nil {
+			metrics.Observe("http_request_duration", time.Since(start))
+			metrics.Inc("http_requests_total")
+			switch {
+			case recorder.status >= 500:
+				metrics.Inc("http_requests_5xx_total")
+			case recorder.status >= 400:
+				metrics.Inc("http_requests_4xx_total")
+			default:
+				metrics.Inc("http_requests_2xx_3xx_total")
+			}
+		}
+		if logger != nil {
+			fields := map[string]string{
+				"method":   r.Method,
+				"route":    r.URL.Path,
+				"status":   strconv.Itoa(recorder.status),
+				"duration": time.Since(start).String(),
+			}
+			if identity, ok := auth.IdentityFromContext(r.Context()); ok {
+				fields["providerId"] = identity.ProviderID
+			}
+			logger.Info(r.Context(), "http_request", fields)
+		}
 	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(body []byte) (int, error) {
+	return r.ResponseWriter.Write(body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/edinorneto/backend-challenge-go/internal/config"
 	"github.com/edinorneto/backend-challenge-go/internal/messaging"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
@@ -21,6 +23,8 @@ type OutboxPublisher struct {
 	repo      ports.OutboxRepository
 	publisher ports.OutboxMessagePublisher
 	cfg       config.Config
+	logger    *observability.Logger
+	metrics   *observability.Metrics
 	owner     string
 
 	mu     sync.Mutex
@@ -28,13 +32,22 @@ type OutboxPublisher struct {
 	wg     sync.WaitGroup
 }
 
-func NewOutboxPublisher(repo ports.OutboxRepository, publisher ports.OutboxMessagePublisher, cfg config.Config) *OutboxPublisher {
-	return &OutboxPublisher{
+func NewOutboxPublisher(repo ports.OutboxRepository, publisher ports.OutboxMessagePublisher, cfg config.Config, options ...any) *OutboxPublisher {
+	result := &OutboxPublisher{
 		repo:      repo,
 		publisher: publisher,
 		cfg:       cfg,
 		owner:     newPublisherOwner(),
 	}
+	for _, option := range options {
+		switch value := option.(type) {
+		case *observability.Logger:
+			result.logger = value
+		case *observability.Metrics:
+			result.metrics = value
+		}
+	}
+	return result
 }
 
 func newPublisherOwner() string {
@@ -138,6 +151,19 @@ func (p *OutboxPublisher) publishPending(ctx context.Context) error {
 	if len(events) == 0 {
 		return nil
 	}
+	if p.metrics != nil {
+		p.metrics.Inc("outbox_claimed_total")
+	}
+	if p.logger != nil {
+		for _, event := range events {
+			p.logger.Info(ctx, "outbox_event_claimed", map[string]string{"eventId": event.EventID.String(), "aggregateId": event.AggregateID.String(), "attempt": fmt.Sprint(event.Attempts + 1), "owner": p.owner})
+		}
+	}
+	if p.metrics != nil {
+		for _, event := range events {
+			p.metrics.Observe("outbox_lag", time.Since(event.CreatedAt))
+		}
+	}
 
 	for _, event := range events {
 		if err := p.publishEvent(ctx, event); err != nil {
@@ -150,6 +176,12 @@ func (p *OutboxPublisher) publishPending(ctx context.Context) error {
 				p.owner,
 			); rescheduleErr != nil {
 				return rescheduleErr
+			}
+			if p.metrics != nil {
+				p.metrics.Inc("outbox_reschedules_total")
+			}
+			if p.logger != nil {
+				p.logger.Error(ctx, "outbox_event_rescheduled", err, map[string]string{"eventId": event.EventID.String(), "attempt": fmt.Sprint(event.Attempts + 1)})
 			}
 		}
 	}
@@ -167,9 +199,27 @@ func (p *OutboxPublisher) publishEvent(ctx context.Context, event ports.OutboxEv
 		MessageDeduplicationID: event.EventID.String(),
 	}
 	if err := p.publisher.Publish(ctx, message); err != nil {
+		if p.metrics != nil {
+			p.metrics.Inc("outbox_publish_failures_total")
+			p.metrics.Inc("outbox_retries_total")
+		}
+		if p.logger != nil {
+			p.logger.Error(ctx, "outbox_publish_failed", err, map[string]string{"eventId": event.EventID.String(), "aggregateId": event.AggregateID.String()})
+		}
 		return err
 	}
-	return p.repo.MarkPublished(ctx, event.EventID, p.owner)
+	err = p.repo.MarkPublished(ctx, event.EventID, p.owner)
+	if err == nil {
+		if p.metrics != nil {
+			p.metrics.Inc("outbox_published_total")
+		}
+		if p.logger != nil {
+			p.logger.Info(ctx, "outbox_event_published", map[string]string{"eventId": event.EventID.String(), "aggregateId": event.AggregateID.String()})
+		}
+	} else if p.logger != nil {
+		p.logger.Error(ctx, "outbox_mark_published_failed", err, map[string]string{"eventId": event.EventID.String()})
+	}
+	return err
 }
 
 func (p *OutboxPublisher) retryDelay(attempt int) time.Duration {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/edinorneto/backend-challenge-go/internal/domain/money"
 	"github.com/edinorneto/backend-challenge-go/internal/messaging"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
@@ -20,6 +21,8 @@ type QueueConsumerConfig struct {
 	WaitTimeSeconds       int
 	VisibilityTimeoutSecs int
 	RetryDelay            time.Duration
+	RetryMaxDelay         time.Duration
+	MaxReceiveCount       int
 }
 
 type QueueConsumer struct {
@@ -29,18 +32,33 @@ type QueueConsumer struct {
 	wagering  ports.WageringService
 	txManager ports.TransactionManager
 	cfg       QueueConsumerConfig
+	logger    *observability.Logger
+	metrics   *observability.Metrics
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
-func NewFinancialQueueConsumer(receiver ports.QueueReceiver, inbox ports.InboxRepository, wagering ports.WageringService, txManager ports.TransactionManager, cfg QueueConsumerConfig) *QueueConsumer {
-	return &QueueConsumer{receiver: receiver, inbox: inbox, wagering: wagering, txManager: txManager, cfg: cfg}
+func NewFinancialQueueConsumer(receiver ports.QueueReceiver, inbox ports.InboxRepository, wagering ports.WageringService, txManager ports.TransactionManager, cfg QueueConsumerConfig, options ...any) *QueueConsumer {
+	return newQueueConsumer(receiver, inbox, wagering, txManager, nil, cfg, options...)
 }
 
-func NewQueueConsumer(receiver ports.QueueReceiver, inbox ports.InboxRepository, effect ports.InboxEffect, cfg QueueConsumerConfig) *QueueConsumer {
-	return &QueueConsumer{receiver: receiver, inbox: inbox, effect: effect, cfg: cfg}
+func NewQueueConsumer(receiver ports.QueueReceiver, inbox ports.InboxRepository, effect ports.InboxEffect, cfg QueueConsumerConfig, options ...any) *QueueConsumer {
+	return newQueueConsumer(receiver, inbox, nil, nil, effect, cfg, options...)
+}
+
+func newQueueConsumer(receiver ports.QueueReceiver, inbox ports.InboxRepository, wagering ports.WageringService, txManager ports.TransactionManager, effect ports.InboxEffect, cfg QueueConsumerConfig, options ...any) *QueueConsumer {
+	consumer := &QueueConsumer{receiver: receiver, inbox: inbox, wagering: wagering, txManager: txManager, effect: effect, cfg: cfg}
+	for _, option := range options {
+		switch value := option.(type) {
+		case *observability.Logger:
+			consumer.logger = value
+		case *observability.Metrics:
+			consumer.metrics = value
+		}
+	}
+	return consumer
 }
 
 func (c *QueueConsumer) Start(ctx context.Context) error {
@@ -112,14 +130,28 @@ func (c *QueueConsumer) loop(ctx context.Context) {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
-			log.Printf("queue consumer receive: %v", err)
+			if c.logger != nil {
+				c.logger.Error(ctx, "consumer_receive_failed", err, nil)
+			} else {
+				log.Printf("queue consumer receive: %v", err)
+			}
+			if c.metrics != nil {
+				c.metrics.Inc("sqs_consumer_failures_total")
+			}
 			if !wait(ctx, retryDelay) {
 				return
 			}
 			continue
 		}
 		if err := c.processBatch(ctx, messages); err != nil {
-			log.Printf("queue consumer batch: %v", err)
+			if c.logger != nil {
+				c.logger.Error(ctx, "consumer_batch_failed", err, nil)
+			} else {
+				log.Printf("queue consumer batch: %v", err)
+			}
+			if c.metrics != nil {
+				c.metrics.Inc("sqs_consumer_failures_total")
+			}
 		}
 	}
 }
@@ -139,6 +171,7 @@ func (c *QueueConsumer) processBatch(ctx context.Context, messages []ports.Queue
 			defer wg.Done()
 			for _, message := range group {
 				if err := c.processMessage(ctx, message); err != nil {
+					c.scheduleRetry(ctx, message, err)
 					errCh <- err
 					return
 				}
@@ -151,6 +184,69 @@ func (c *QueueConsumer) processBatch(ctx context.Context, messages []ports.Queue
 		return err
 	}
 	return nil
+}
+
+func (c *QueueConsumer) scheduleRetry(ctx context.Context, message ports.QueueMessage, cause error) {
+	changer, ok := c.receiver.(ports.QueueVisibilityChanger)
+	if !ok {
+		return
+	}
+	delay := retryDelay(message.ReceiveCount, c.cfg.RetryDelay, c.cfg.RetryMaxDelay)
+	seconds := int((delay + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	if err := changer.ChangeVisibility(ctx, message.ReceiptHandle, seconds); err != nil {
+		if c.logger != nil {
+			c.logger.Error(ctx, "consumer_retry_visibility_failed", err, map[string]string{
+				"messageId": message.MessageID,
+				"attempt":   fmt.Sprint(message.ReceiveCount),
+			})
+		}
+		return
+	}
+	if c.metrics != nil {
+		c.metrics.Inc("sqs_retries_total")
+		if message.ReceiveCount > 0 {
+			c.metrics.Inc("sqs_messages_retried_total")
+		}
+		if c.cfg.MaxReceiveCount > 0 && message.ReceiveCount >= c.cfg.MaxReceiveCount {
+			c.metrics.Inc("sqs_messages_dlq_eligible_total")
+		}
+	}
+	if c.logger != nil {
+		c.logger.Error(ctx, "consumer_message_retry_scheduled", cause, map[string]string{
+			"messageId": message.MessageID,
+			"attempt":   fmt.Sprint(message.ReceiveCount),
+			"duration":  delay.String(),
+		})
+	}
+}
+
+func retryDelay(receiveCount int, initial, maximum time.Duration) time.Duration {
+	if initial <= 0 {
+		initial = time.Second
+	}
+	if maximum <= 0 {
+		maximum = 30 * time.Second
+	}
+	if initial > maximum {
+		return maximum
+	}
+	if receiveCount < 1 {
+		receiveCount = 1
+	}
+	delay := initial
+	for i := 1; i < receiveCount; i++ {
+		if delay > maximum/2 {
+			return maximum
+		}
+		delay *= 2
+		if delay >= maximum {
+			return maximum
+		}
+	}
+	return delay
 }
 
 func (c *QueueConsumer) processMessage(ctx context.Context, message ports.QueueMessage) error {
@@ -179,6 +275,11 @@ func (c *QueueConsumer) processCommand(ctx context.Context, message ports.QueueM
 	if err := command.Validate(); err != nil {
 		return fmt.Errorf("validate transaction command %s: %w", message.MessageID, err)
 	}
+	if c.logger != nil {
+		c.logger.Info(ctx, "consumer_command_validated", map[string]string{
+			"messageId": command.MessageID, "walletId": command.Data.WalletID.String(), "providerId": command.Data.ProviderID,
+		})
+	}
 	amount, err := money.ParseExternal(command.Data.Money.Amount, command.Data.Money.Currency)
 	if err != nil {
 		return fmt.Errorf("parse transaction command money: %w", err)
@@ -189,7 +290,7 @@ func (c *QueueConsumer) processCommand(ctx context.Context, message ports.QueueM
 	}
 	defer tx.Rollback(ctx)
 	duplicate, err := c.inbox.Process(txCtx, c.cfg.Name, command.MessageID, []byte(message.Body), func(effectCtx context.Context, _ []byte) error {
-		_, err := c.wagering.ProcessTransaction(effectCtx, command.Data.IdempotencyKey, ports.WageringRequest{
+		result, err := c.wagering.ProcessTransaction(effectCtx, command.Data.IdempotencyKey, ports.WageringRequest{
 			ProviderID:                     command.Data.ProviderID,
 			ExternalTransactionID:          command.Data.ExternalTransactionID,
 			PlayerID:                       command.Data.PlayerID,
@@ -200,13 +301,48 @@ func (c *QueueConsumer) processCommand(ctx context.Context, message ports.QueueM
 			Amount:                         amount,
 			ReferenceExternalTransactionID: command.Data.ReferenceExternalTransactionID,
 		})
+		if err == nil {
+			if c.metrics != nil {
+				c.metrics.Inc("wager_results_total")
+				if result.IdempotentReplay {
+					c.metrics.Inc("idempotency_replays_total")
+				}
+				if result.Status == "REJECTED" {
+					c.metrics.Inc("wager_rejections_total")
+				}
+				if result.FailureCode == "insufficient_funds" ||
+					result.FailureCode == "reversal_insufficient_funds" {
+					c.metrics.Inc("wager_balance_conflicts_total")
+				}
+			}
+			if c.logger != nil {
+				fields := map[string]string{
+					"messageId": command.MessageID, "walletId": command.Data.WalletID.String(),
+					"providerId": command.Data.ProviderID, "transactionId": result.TransactionID.String(),
+					"status": result.Status,
+				}
+				c.logger.Info(effectCtx, "consumer_financial_processing_completed", fields)
+			}
+		}
 		return err
 	})
 	if err != nil {
+		if c.metrics != nil {
+			c.metrics.Inc("sqs_consumer_failures_total")
+		}
 		return err
+	}
+	if duplicate && c.metrics != nil {
+		c.metrics.Inc("inbox_duplicates_total")
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction command: %w", err)
+	}
+	if c.metrics != nil {
+		c.metrics.Inc("wager_processing_total")
+	}
+	if c.logger != nil {
+		c.logger.Info(ctx, "consumer_message_deleted", map[string]string{"messageId": command.MessageID, "walletId": command.Data.WalletID.String(), "providerId": command.Data.ProviderID})
 	}
 	_ = duplicate
 	return c.receiver.Delete(ctx, message.ReceiptHandle)

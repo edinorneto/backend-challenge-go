@@ -12,6 +12,7 @@ import (
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database/migrations"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/sqs"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 
 	"go.uber.org/fx"
@@ -21,6 +22,8 @@ func main() {
 	fx.New(
 		fx.Provide(
 			config.Load,
+			observability.NewLogger,
+			observability.NewMetrics,
 			auth.NewVerifier,
 			auth.NewMiddleware,
 			database.NewPool,
@@ -48,20 +51,26 @@ func main() {
 			func(publisher *sqs.Publisher) ports.OutboxMessagePublisher {
 				return publisher
 			},
-			application.NewWalletService,
-			application.NewWageringService,
-			application.NewOutboxPublisher,
-			func(repo *database.WalletRepo, cfg config.Config) *application.ReferenceWorker {
-				return application.NewReferenceWorker(repo, cfg)
+			func(repo ports.WalletRepository, metrics *observability.Metrics) *application.WalletService {
+				return application.NewWalletService(repo, metrics)
 			},
-			func(receiver *sqs.Consumer, inbox ports.InboxRepository, wagering *application.WageringService, txManager *database.TransactionManager) *application.QueueConsumer {
+			application.NewWageringService,
+			func(repo ports.OutboxRepository, publisher ports.OutboxMessagePublisher, cfg config.Config, logger *observability.Logger, metrics *observability.Metrics) *application.OutboxPublisher {
+				return application.NewOutboxPublisher(repo, publisher, cfg, logger, metrics)
+			},
+			func(repo *database.WalletRepo, cfg config.Config, logger *observability.Logger, metrics *observability.Metrics) *application.ReferenceWorker {
+				return application.NewReferenceWorker(repo, cfg, logger, metrics)
+			},
+			func(receiver *sqs.Consumer, inbox ports.InboxRepository, wagering *application.WageringService, txManager *database.TransactionManager, cfg config.Config, logger *observability.Logger, metrics *observability.Metrics) *application.QueueConsumer {
 				return application.NewFinancialQueueConsumer(receiver, inbox, wagering, txManager, application.QueueConsumerConfig{
 					Name:                  "transaction-consumer",
 					BatchSize:             10,
 					WaitTimeSeconds:       20,
 					VisibilityTimeoutSecs: 30,
 					RetryDelay:            time.Second,
-				})
+					RetryMaxDelay:         30 * time.Second,
+					MaxReceiveCount:       cfg.MaxReceiveCount,
+				}, logger, metrics)
 			},
 			httpapi.NewServer,
 		),

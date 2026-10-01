@@ -85,6 +85,31 @@ event SQS FIFO queue. These events are never interpreted as input commands.
 Failed processing leaves command messages available for redelivery and the
 existing SQS redrive policy remains responsible for the DLQ.
 
+Consumer delivery is at-least-once. The SQS adapter reads
+`ApproximateReceiveCount` and exposes it with the message, so retry state is
+not kept only in application memory and survives restarts and multiple
+instances. A processing failure leaves the message undeleted and schedules its
+next delivery with `ChangeMessageVisibility`. The delay is exponential,
+starting at 1 second and capped at 30 seconds by the application defaults.
+There is no worker sleep while waiting for a retry.
+
+The queue redrive policy, not the application, decides when a message reaches
+the DLQ (`SQS_MAX_RECEIVE_COUNT`, default 5 in Compose). Invalid JSON, invalid
+envelopes, and invalid commands are poison messages: they cannot produce a
+financial effect and remain undeleted so SQS can redrive them. Business
+rejections are different: the financial transaction persists the rejected
+result, then the committed message is deleted. This prevents permanent
+business decisions from becoming infinite retries.
+
+Retry and DLQ-eligibility counters are observations only. In particular,
+`sqs_messages_dlq_eligible_total` does not delete or quarantine a message and
+does not replace the queue's redrive decision.
+
+On SIGTERM, lifecycle cancellation stops polling and waits for the consumer
+goroutine. A message in flight without a completed delete becomes visible
+again and is redelivered; a message whose database transaction committed is
+protected by the Inbox and will not apply the financial effect twice.
+
 The application also runs a pending-reference worker for
 `PENDING_REFERENCE`. It polls due rows from `wager_transactions`, claims one
 row with `FOR UPDATE SKIP LOCKED`, and keeps that lock while the existing
@@ -113,3 +138,19 @@ instance has its own memory, connection pool, consumers, publisher, and
 pending-reference worker, while financial state is shared through PostgreSQL
 and SQS. An Nginx reverse proxy provides the single external HTTP endpoint and
 forwards requests to the scaled application service.
+
+## Observability
+
+HTTP requests and asynchronous worker transitions use a small structured JSON
+logger. Logs contain UTC timestamps, level, event name, safe identifiers and
+durations when available. `Correlation-ID` is propagated through the request
+context and response; a UUID is generated when the client does not provide
+one. Authorization headers, tokens, secrets, passwords and complete financial
+payloads are not fields in the logger API.
+
+`GET /metrics` exposes Prometheus-compatible counters and summaries. The
+registry records operation results, Inbox duplicates, consumer and reference
+retries/failures, outbox claims/publications/failures, reconciliation runs and
+divergences, plus HTTP request and outbox processing timing. Individual
+wallet, transaction, provider, message and correlation IDs are deliberately
+not metric labels, so series cardinality remains bounded.

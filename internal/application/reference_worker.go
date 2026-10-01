@@ -8,22 +8,34 @@ import (
 	"time"
 
 	"github.com/edinorneto/backend-challenge-go/internal/config"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
 var ErrReferenceWorkerNotConfigured = errors.New("reference worker is not configured")
 
 type ReferenceWorker struct {
-	repo ports.PendingReferenceRepository
-	cfg  config.Config
+	repo    ports.PendingReferenceRepository
+	cfg     config.Config
+	logger  *observability.Logger
+	metrics *observability.Metrics
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
-func NewReferenceWorker(repo ports.PendingReferenceRepository, cfg config.Config) *ReferenceWorker {
-	return &ReferenceWorker{repo: repo, cfg: cfg}
+func NewReferenceWorker(repo ports.PendingReferenceRepository, cfg config.Config, options ...any) *ReferenceWorker {
+	worker := &ReferenceWorker{repo: repo, cfg: cfg}
+	for _, option := range options {
+		switch value := option.(type) {
+		case *observability.Logger:
+			worker.logger = value
+		case *observability.Metrics:
+			worker.metrics = value
+		}
+	}
+	return worker
 }
 
 func (w *ReferenceWorker) Start(ctx context.Context) error {
@@ -85,9 +97,19 @@ func (w *ReferenceWorker) loop(ctx context.Context) {
 	for {
 		processed, err := w.repo.ProcessNextPendingReference(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("reference worker: %v", err)
+			if w.logger != nil {
+				w.logger.Error(ctx, "reference_worker_failed", err, nil)
+			} else {
+				log.Printf("reference worker: %v", err)
+			}
+			if w.metrics != nil {
+				w.metrics.Inc("reference_retries_total")
+			}
 		}
 		if processed {
+			if w.metrics != nil {
+				w.metrics.Inc("reconciliation_processed_total")
+			}
 			continue
 		}
 

@@ -165,11 +165,16 @@ type QueueMessage struct {
 	ReceiptHandle string
 	Body          string
 	MessageGroup  string
+	ReceiveCount  int
 }
 
 type QueueReceiver interface {
 	Receive(ctx context.Context, batchSize int, waitTimeSeconds int, visibilityTimeoutSeconds int) ([]QueueMessage, error)
 	Delete(ctx context.Context, receiptHandle string) error
+}
+
+type QueueVisibilityChanger interface {
+	ChangeVisibility(ctx context.Context, receiptHandle string, visibilityTimeoutSeconds int) error
 }
 
 type InboxEffect = func(ctx context.Context, envelope []byte) error

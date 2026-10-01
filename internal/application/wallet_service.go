@@ -8,17 +8,23 @@ import (
 
 	"github.com/edinorneto/backend-challenge-go/internal/domain/money"
 	"github.com/edinorneto/backend-challenge-go/internal/domain/wallet"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
 type WalletService struct {
-	repo ports.WalletRepository
+	repo    ports.WalletRepository
+	metrics *observability.Metrics
 }
 
-func NewWalletService(repo ports.WalletRepository) *WalletService {
-	return &WalletService{
-		repo: repo,
+func NewWalletService(repo ports.WalletRepository, options ...any) *WalletService {
+	service := &WalletService{repo: repo}
+	for _, option := range options {
+		if metrics, ok := option.(*observability.Metrics); ok {
+			service.metrics = metrics
+		}
 	}
+	return service
 }
 
 func (s *WalletService) CreateWallet(
@@ -55,5 +61,12 @@ func (s *WalletService) GetLedger(ctx context.Context, walletID uuid.UUID, curso
 }
 
 func (s *WalletService) Reconcile(ctx context.Context, walletID uuid.UUID) (ports.ReconciliationView, error) {
-	return s.repo.Reconcile(ctx, walletID)
+	if s.metrics != nil {
+		s.metrics.Inc("reconciliation_total")
+	}
+	result, err := s.repo.Reconcile(ctx, walletID)
+	if err == nil && !result.Consistent && s.metrics != nil {
+		s.metrics.Inc("reconciliation_divergences_total")
+	}
+	return result, err
 }

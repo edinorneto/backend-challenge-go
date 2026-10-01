@@ -3,6 +3,7 @@ package sqs
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -124,14 +125,44 @@ func (c *Consumer) Receive(ctx context.Context, batchSize int, waitTimeSeconds i
 		if value, ok := message.Attributes["MessageGroupId"]; ok {
 			group = value
 		}
+		receiveCount := 0
+		if value, ok := message.Attributes["ApproximateReceiveCount"]; ok {
+			var err error
+			receiveCount, err = strconv.Atoi(value)
+			if err != nil || receiveCount < 1 {
+				return nil, fmt.Errorf("invalid SQS ApproximateReceiveCount %q", value)
+			}
+		}
 		messages = append(messages, ports.QueueMessage{
 			MessageID:     *message.MessageId,
 			ReceiptHandle: *message.ReceiptHandle,
 			Body:          *message.Body,
 			MessageGroup:  group,
+			ReceiveCount:  receiveCount,
 		})
 	}
 	return messages, nil
+}
+
+func (c *Consumer) ChangeVisibility(ctx context.Context, receiptHandle string, visibilityTimeoutSeconds int) error {
+	if c == nil || c.client == nil || c.client.api == nil {
+		return fmt.Errorf("sqs consumer is not configured")
+	}
+	if c.queueURL == "" || receiptHandle == "" {
+		return fmt.Errorf("sqs queue URL and receipt handle are required")
+	}
+	if visibilityTimeoutSeconds < 0 {
+		return fmt.Errorf("visibility timeout must not be negative")
+	}
+	_, err := c.client.api.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+		QueueUrl:          &c.queueURL,
+		ReceiptHandle:     &receiptHandle,
+		VisibilityTimeout: int32(visibilityTimeoutSeconds),
+	})
+	if err != nil {
+		return fmt.Errorf("change SQS message visibility: %w", err)
+	}
+	return nil
 }
 
 func (c *Consumer) Delete(ctx context.Context, receiptHandle string) error {
