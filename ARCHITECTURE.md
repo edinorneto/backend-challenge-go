@@ -1,5 +1,10 @@
 # Architecture
 
+The current runtime is composed with a named Uber Fx module (`backend-api`).
+Construction, startup and shutdown are lifecycle-managed so HTTP, SQS workers,
+the outbox publisher, pending-reference worker, migrations and PostgreSQL release
+are part of one application composition.
+
 The current runtime is composed with Uber Fx:
 
 ```text
@@ -154,3 +159,10 @@ retries/failures, outbox claims/publications/failures, reconciliation runs and
 divergences, plus HTTP request and outbox processing timing. Individual
 wallet, transaction, provider, message and correlation IDs are deliberately
 not metric labels, so series cardinality remains bounded.
+
+## Database migrations
+
+Database changes are versioned in embedded `up` and `down` SQL files. Startup runs
+pending migrations under a PostgreSQL advisory lock. The standalone `cmd/migrate`
+command can explicitly apply or revert versions, using the same lock and reversing
+versions in order.

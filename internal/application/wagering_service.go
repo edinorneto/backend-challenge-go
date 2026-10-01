@@ -55,7 +55,9 @@ func (s *WageringService) ProcessTransaction(
 	}
 
 	kind := strings.ToUpper(strings.TrimSpace(req.Kind))
-	if kind == "" {
+	switch kind {
+	case "BET", "WIN", "LOSS", "REFUND", "ROLLBACK":
+	default:
 		return ports.ProcessTransactionResult{}, ErrInvalidWagerRequest
 	}
 	if (kind == "REFUND" || kind == "ROLLBACK") &&

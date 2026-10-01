@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -19,7 +20,15 @@ import (
 )
 
 func main() {
-	fx.New(
+	NewApp().Run()
+}
+
+func NewApp() *fx.App {
+	return fx.New(AppOptions())
+}
+
+func AppOptions() fx.Option {
+	return fx.Module("backend-api",
 		fx.Provide(
 			config.Load,
 			observability.NewLogger,
@@ -74,13 +83,12 @@ func main() {
 			},
 			httpapi.NewServer,
 		),
-
 		fx.Invoke(
 			func(_ *migrations.Runner) {},
 			startMessaging,
 			runHTTP,
 		),
-	).Run()
+	)
 }
 
 func startMessaging(
@@ -140,6 +148,7 @@ func runHTTP(
 	lc fx.Lifecycle,
 	cfg config.Config,
 	server *httpapi.Server,
+	logger *observability.Logger,
 ) {
 	httpServer := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -150,7 +159,10 @@ func runHTTP(
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 			go func() {
-				_ = httpServer.ListenAndServe()
+				err := httpServer.ListenAndServe()
+				if err != nil && !errors.Is(err, http.ErrServerClosed) && logger != nil {
+					logger.Error(context.Background(), "http_server_failed", err, map[string]string{"address": cfg.HTTPAddr})
+				}
 			}()
 
 			return nil

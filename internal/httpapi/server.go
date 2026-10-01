@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -159,7 +160,7 @@ func (s *Server) walletsHandler(w http.ResponseWriter, r *http.Request) {
 
 	decoder := json.NewDecoder(r.Body)
 
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeSingleJSON(decoder, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "invalid_json",
 		})
@@ -269,6 +270,20 @@ func (r *statusRecorder) Write(body []byte) (int, error) {
 	return r.ResponseWriter.Write(body)
 }
 
+func decodeSingleJSON(decoder *json.Decoder, target any) error {
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -326,7 +341,7 @@ func (s *Server) getLedgerHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "wallet_not_found"})
 			return
 		}
-		if strings.Contains(err.Error(), "cursor") {
+		if errors.Is(err, database.ErrInvalidLedgerCursor) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_cursor"})
 			return
 		}
@@ -383,6 +398,11 @@ func (s *Server) getTransactionHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_transaction_id"})
 		return
 	}
+	identity, ok := auth.IdentityFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "provider_identity_required"})
+		return
+	}
 	transaction, err := s.wagering.GetTransaction(r.Context(), transactionID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -390,11 +410,6 @@ func (s *Server) getTransactionHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
-		return
-	}
-	identity, ok := auth.IdentityFromContext(r.Context())
-	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "provider_identity_required"})
 		return
 	}
 	if !identity.HasRole("wallet-internal") && identity.ProviderID != transaction.ProviderID {
@@ -490,7 +505,7 @@ func (s *Server) wageringHandler(w http.ResponseWriter, r *http.Request) {
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodeSingleJSON(decoder, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "invalid_json",
 		})

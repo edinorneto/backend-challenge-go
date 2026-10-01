@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -115,6 +116,35 @@ func TestWageringServiceProcessesRequest(t *testing.T) {
 	}
 	if result.TransactionID == uuid.Nil {
 		t.Fatal("expected transaction id")
+	}
+}
+
+func TestWageringServiceRejectsOpeningAndUnknownKinds(t *testing.T) {
+	repo := &stubWageringRepo{}
+	service := NewWageringService(repo)
+	amount, err := money.ParseExternal("1.00", "BRL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := ports.WageringRequest{
+		ProviderID:            "provider-a",
+		ExternalTransactionID: "external-1",
+		PlayerID:              uuid.New(),
+		WalletID:              uuid.New(),
+		RoundID:               "round",
+		GameID:                "game",
+		Amount:                amount,
+	}
+
+	for _, kind := range []string{"OPENING", "INVALID"} {
+		request := base
+		request.Kind = kind
+		if _, err := service.ProcessTransaction(context.Background(), "idem-"+kind, request); !errors.Is(err, ErrInvalidWagerRequest) {
+			t.Fatalf("kind %q: expected invalid wager request, got %v", kind, err)
+		}
+	}
+	if repo.calls != 0 {
+		t.Fatalf("repository must not be called for invalid external kind, got %d calls", repo.calls)
 	}
 }
 

@@ -241,7 +241,7 @@ func min(a, b int) int {
 }
 
 func marshalEnvelope(event ports.OutboxEvent) ([]byte, error) {
-	return json.Marshal(messaging.EventEnvelope{
+	envelope := messaging.EventEnvelope{
 		EventID:       event.EventID,
 		EventType:     event.EventType,
 		AggregateID:   event.AggregateID,
@@ -250,5 +250,9 @@ func marshalEnvelope(event ports.OutboxEvent) ([]byte, error) {
 		OccurredAt:    event.OccurredAt.UTC(),
 		Version:       event.Version,
 		Data:          event.Payload,
-	})
+	}
+	if err := envelope.Validate(); err != nil {
+		return nil, fmt.Errorf("validate event envelope: %w", err)
+	}
+	return json.Marshal(envelope)
 }

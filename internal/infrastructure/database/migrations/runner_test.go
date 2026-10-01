@@ -14,7 +14,7 @@ import (
 func TestRunnerConcurrentUpIsSerialized(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		databaseURL = "******localhost:5432/betting?sslmode=disable"
+		databaseURL = "postgres://postgres:postgres@localhost:5432/betting?sslmode=disable"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -75,5 +75,73 @@ func TestRunnerConcurrentUpIsSerialized(t *testing.T) {
 	}
 	if migrationCount != 3 {
 		t.Fatalf("expected three applied migrations, got %d", migrationCount)
+	}
+}
+
+func TestRunnerDownRevertsLatestMigrations(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = "postgres://postgres:postgres@localhost:5432/betting?sslmode=disable"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	basePool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Skipf("PostgreSQL unavailable: %v", err)
+	}
+	defer basePool.Close()
+	if err := basePool.Ping(ctx); err != nil {
+		t.Skipf("PostgreSQL unavailable: %v", err)
+	}
+
+	schema := "migration_down_test_" + uuid.New().String()[:8]
+	if _, err := basePool.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = basePool.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`) }()
+
+	pCfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pCfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, pCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	runner := &Runner{pool: pool}
+	if err := runner.Up(ctx); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	if err := runner.Down(ctx, 1); err != nil {
+		t.Fatalf("down one: %v", err)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected two migrations after one revert, got %d", count)
+	}
+
+	if err := runner.Down(ctx, 2); err != nil {
+		t.Fatalf("down remaining: %v", err)
+	}
+	var remaining int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected no applied migrations after full revert, got %d", remaining)
+	}
+	var walletsTable *string
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('wallets')`).Scan(&walletsTable); err != nil {
+		t.Fatal(err)
+	}
+	if walletsTable != nil {
+		t.Fatal("expected initial migration revert to drop application tables")
 	}
 }

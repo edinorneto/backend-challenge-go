@@ -77,6 +77,18 @@ func TestWageringUsesAuthenticatedProviderInsteadOfBody(t *testing.T) {
 	}
 }
 
+func TestGetTransactionRejectsMissingIdentityBeforeLookup(t *testing.T) {
+	repo := &authTestWageringRepo{transaction: ports.TransactionView{ID: uuid.New(), ProviderID: "provider-a", Status: "PROCESSED"}}
+	server := &Server{wagering: application.NewWageringService(repo)}
+	request := httptest.NewRequest(http.MethodGet, "/wagering/transactions/"+repo.transaction.ID.String(), nil)
+	request.SetPathValue("transactionID", repo.transaction.ID.String())
+	response := httptest.NewRecorder()
+	server.getTransactionHandler(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without identity, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
 func TestGetTransactionRequiresMatchingProviderOrInternalRole(t *testing.T) {
 	transactionID := uuid.New()
 	repo := &authTestWageringRepo{transaction: ports.TransactionView{

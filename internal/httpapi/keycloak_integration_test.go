@@ -22,6 +22,7 @@ import (
 	"github.com/edinorneto/backend-challenge-go/internal/auth"
 	"github.com/edinorneto/backend-challenge-go/internal/config"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database"
+	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database/migrations"
 )
 
 func TestKeycloakProviderIsolationAndInternalHTTPAccess(t *testing.T) {
@@ -38,7 +39,8 @@ func TestKeycloakProviderIsolationAndInternalHTTPAccess(t *testing.T) {
 	providerBToken := keycloakToken(t, ctx, "password", "provider-b", "provider-b", "", cfg)
 	internalToken := keycloakToken(t, ctx, "client_credentials", "", "", envOrHTTP("BACKEND_INTERNAL_SECRET", "backend-internal-secret"), cfg)
 
-	pool := integrationHTTPPool(t, ctx)
+	pool, cleanupPool := integrationHTTPPool(t, ctx)
+	t.Cleanup(cleanupPool)
 	walletRepo := database.NewWalletRepo(pool)
 	wagering := application.NewWageringService(walletRepo)
 	verifier, err := auth.NewVerifier(cfg)
@@ -59,6 +61,21 @@ func TestKeycloakProviderIsolationAndInternalHTTPAccess(t *testing.T) {
 	walletID := createIntegrationWallet(t, httpServer.Client(), httpServer.URL, internalToken, playerID)
 	defer cleanupIntegrationWallet(t, pool, walletID)
 
+	providerWalletCreateBody := fmt.Sprintf(`{"playerId":"%s","initialBalance":{"amount":"1.00","currency":"BRL"}}`, uuid.New())
+	providerWalletCreate := doHTTP(t, httpServer.Client(), httpServer.URL+"/wallets", providerAToken, "POST", "", providerWalletCreateBody)
+	if providerWalletCreate.StatusCode != http.StatusForbidden {
+		t.Fatalf("provider should not create wallets: %d %s", providerWalletCreate.StatusCode, providerWalletCreate.Body)
+	}
+
+	providerWalletRead := doHTTP(t, httpServer.Client(), httpServer.URL+"/wallets/"+walletID.String(), providerAToken, "GET", "", "")
+	if providerWalletRead.StatusCode != http.StatusForbidden {
+		t.Fatalf("provider should not read internal wallet: %d %s", providerWalletRead.StatusCode, providerWalletRead.Body)
+	}
+	internalWalletRead := doHTTP(t, httpServer.Client(), httpServer.URL+"/wallets/"+walletID.String(), internalToken, "GET", "", "")
+	if internalWalletRead.StatusCode != http.StatusOK {
+		t.Fatalf("internal service could not read wallet: %d %s", internalWalletRead.StatusCode, internalWalletRead.Body)
+	}
+
 	externalID := "keycloak-http-" + uuid.NewString()
 	idempotencyKey := "keycloak-idem-" + uuid.NewString()
 	body := fmt.Sprintf(`{"providerId":"provider-b","externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"round","gameId":"game","kind":"BET","money":{"amount":"1.00","currency":"BRL"}}`, externalID, playerID, walletID)
@@ -73,6 +90,28 @@ func TestKeycloakProviderIsolationAndInternalHTTPAccess(t *testing.T) {
 	decodeHTTP(t, response, &operation)
 	if operation.TransactionID == uuid.Nil || operation.Status != "PROCESSED" {
 		t.Fatalf("unexpected operation response: %+v", operation)
+	}
+
+	ledgerPage1 := doHTTP(t, httpServer.Client(), httpServer.URL+"/wallets/"+walletID.String()+"/ledger?limit=1", internalToken, "GET", "", "")
+	if ledgerPage1.StatusCode != http.StatusOK || !strings.Contains(ledgerPage1.Body, `"entries"`) || !strings.Contains(ledgerPage1.Body, `"nextCursor"`) {
+		t.Fatalf("unexpected ledger page 1 response: %d %s", ledgerPage1.StatusCode, ledgerPage1.Body)
+	}
+	var ledgerResult struct {
+		Entries    []json.RawMessage `json:"entries"`
+		NextCursor string            `json:"nextCursor"`
+	}
+	decodeHTTP(t, ledgerPage1, &ledgerResult)
+	if len(ledgerResult.Entries) != 1 || ledgerResult.NextCursor == "" {
+		t.Fatalf("expected one ledger entry and a continuation cursor: %+v", ledgerResult)
+	}
+	ledgerPage2 := doHTTP(t, httpServer.Client(), httpServer.URL+"/wallets/"+walletID.String()+"/ledger?limit=1&cursor="+url.QueryEscape(ledgerResult.NextCursor), internalToken, "GET", "", "")
+	if ledgerPage2.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected ledger page 2 response: %d %s", ledgerPage2.StatusCode, ledgerPage2.Body)
+	}
+
+	reconciliation := doHTTP(t, httpServer.Client(), httpServer.URL+"/wallets/"+walletID.String()+"/reconciliation", internalToken, "POST", "", "")
+	if reconciliation.StatusCode != http.StatusOK || !strings.Contains(reconciliation.Body, `"consistent":true`) {
+		t.Fatalf("wallet reconciliation failed: %d %s", reconciliation.StatusCode, reconciliation.Body)
 	}
 
 	own := doHTTP(t, httpServer.Client(), httpServer.URL+"/wagering/transactions/"+operation.TransactionID.String(), providerAToken, "GET", "", "")
@@ -101,6 +140,31 @@ func TestKeycloakProviderIsolationAndInternalHTTPAccess(t *testing.T) {
 	conflict := doHTTP(t, httpServer.Client(), httpServer.URL+"/wagering/transactions", providerAToken, "POST", idempotencyKey, conflictBody)
 	if conflict.StatusCode != http.StatusConflict {
 		t.Fatalf("expected idempotency conflict: %d %s", conflict.StatusCode, conflict.Body)
+	}
+
+	rejectedExternalID := "keycloak-rejected-" + uuid.NewString()
+	rejectedBody := fmt.Sprintf(`{"externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"round","gameId":"game","kind":"BET","money":{"amount":"1000.00","currency":"BRL"}}`, rejectedExternalID, playerID, walletID)
+	rejected := doHTTP(t, httpServer.Client(), httpServer.URL+"/wagering/transactions", providerAToken, "POST", "keycloak-rejected-idem-"+uuid.NewString(), rejectedBody)
+	if rejected.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(rejected.Body, `"status":"REJECTED"`) {
+		t.Fatalf("expected business rejection: %d %s", rejected.StatusCode, rejected.Body)
+	}
+
+	missingReferenceExternalID := "keycloak-pending-" + uuid.NewString()
+	pendingBody := fmt.Sprintf(`{"externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"round","gameId":"game","kind":"REFUND","money":{"amount":"1.00","currency":"BRL"},"referenceExternalTransactionId":"missing-reference-%s"}`, missingReferenceExternalID, playerID, walletID, uuid.NewString())
+	pending := doHTTP(t, httpServer.Client(), httpServer.URL+"/wagering/transactions", providerAToken, "POST", "keycloak-pending-idem-"+uuid.NewString(), pendingBody)
+	if pending.StatusCode != http.StatusAccepted || !strings.Contains(pending.Body, `"status":"PENDING_REFERENCE"`) {
+		t.Fatalf("expected pending reference response: %d %s", pending.StatusCode, pending.Body)
+	}
+	var pendingResponse struct {
+		TransactionID uuid.UUID `json:"transactionId"`
+	}
+	decodeHTTP(t, pending, &pendingResponse)
+	if pendingResponse.TransactionID == uuid.Nil {
+		t.Fatalf("pending response missing transaction ID: %s", pending.Body)
+	}
+	pendingQuery := doHTTP(t, httpServer.Client(), httpServer.URL+"/wagering/transactions/"+pendingResponse.TransactionID.String(), providerAToken, "GET", "", "")
+	if pendingQuery.StatusCode != http.StatusOK || !strings.Contains(pendingQuery.Body, `"status":"PENDING_REFERENCE"`) {
+		t.Fatalf("pending transaction query failed: %d %s", pendingQuery.StatusCode, pendingQuery.Body)
 	}
 
 	unauthenticated := doHTTP(t, httpServer.Client(), httpServer.URL+"/wagering/transactions/"+operation.TransactionID.String(), "", "GET", "", "")
@@ -145,19 +209,48 @@ func keycloakToken(t *testing.T, ctx context.Context, grantType, username, passw
 	return token.AccessToken
 }
 
-func integrationHTTPPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
+func integrationHTTPPool(t *testing.T, ctx context.Context) (*pgxpool.Pool, func()) {
 	t.Helper()
-	databaseURL := envOrHTTP("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/betting?sslmode=disable")
-	pool, err := pgxpool.New(ctx, databaseURL)
+	basePool, err := pgxpool.New(ctx, envOrHTTP("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/betting?sslmode=disable"))
 	if err != nil {
-		t.Skipf("PostgreSQL unavailable: %v", err)
+		t.Fatalf("connect to PostgreSQL: %v", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
+	if err := basePool.Ping(ctx); err != nil {
+		basePool.Close()
+		t.Fatalf("ping PostgreSQL: %v", err)
+	}
+	schema := "http_integration_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := basePool.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		basePool.Close()
+		t.Fatalf("create integration schema: %v", err)
+	}
+	databaseURL := envOrHTTP("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/betting?sslmode=disable")
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		_, _ = basePool.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`)
+		basePool.Close()
+		t.Fatalf("parse PostgreSQL URL: %v", err)
+	}
+	poolConfig.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		_, _ = basePool.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`)
+		basePool.Close()
+		t.Fatalf("create isolated PostgreSQL pool: %v", err)
+	}
+	if err := migrations.Run(ctx, pool); err != nil {
 		pool.Close()
-		t.Skipf("PostgreSQL unavailable: %v", err)
+		_, _ = basePool.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`)
+		basePool.Close()
+		t.Fatalf("run isolated PostgreSQL migrations: %v", err)
 	}
-	t.Cleanup(pool.Close)
-	return pool
+	return pool, func() {
+		pool.Close()
+		if _, err := basePool.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`); err != nil {
+			t.Errorf("drop integration schema %s: %v", schema, err)
+		}
+		basePool.Close()
+	}
 }
 
 func createIntegrationWallet(t *testing.T, client *http.Client, baseURL, token string, playerID uuid.UUID) uuid.UUID {
@@ -223,6 +316,7 @@ func cleanupIntegrationWallet(t *testing.T, pool *pgxpool.Pool, walletID uuid.UU
 		   OR aggregate_id IN (SELECT id FROM wager_transactions WHERE wallet_id = $1)
 		   OR correlation_id IN (SELECT id FROM wager_transactions WHERE wallet_id = $1)
 	`, walletID)
+	_, _ = pool.Exec(ctx, `DELETE FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID)
 	_, _ = pool.Exec(ctx, `DELETE FROM wager_transactions WHERE wallet_id = $1`, walletID)
 	_, _ = pool.Exec(ctx, `DELETE FROM wallets WHERE id = $1`, walletID)
 }

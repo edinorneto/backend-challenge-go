@@ -261,6 +261,21 @@ func TestOutboxPublisherReclaimsExpiredLease(t *testing.T) {
 	}
 }
 
+func TestMarshalEnvelopeRejectsInvalidMetadata(t *testing.T) {
+	_, err := marshalEnvelope(ports.OutboxEvent{
+		EventID:       uuid.New(),
+		EventType:     "WalletBalanceChanged",
+		AggregateID:   uuid.New(),
+		CorrelationID: uuid.New(),
+		OccurredAt:    time.Time{},
+		Version:       1,
+		Payload:       json.RawMessage(`{"walletId":"test"}`),
+	})
+	if err == nil {
+		t.Fatal("expected invalid event timestamp to be rejected")
+	}
+}
+
 func TestMarshalEnvelopeReturnsPayloadError(t *testing.T) {
 	_, err := marshalEnvelope(ports.OutboxEvent{
 		EventID:       uuid.New(),

@@ -644,7 +644,7 @@ func isolatedOutboxPool(t *testing.T) (*pgxpool.Pool, func()) {
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		databaseURL = "******localhost:5432/betting?sslmode=disable"
+		databaseURL = "postgres://postgres:postgres@localhost:5432/betting?sslmode=disable"
 	}
 	poolConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {

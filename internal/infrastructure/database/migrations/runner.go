@@ -81,20 +81,9 @@ func (r *Runner) Up(ctx context.Context) error {
 			continue
 		}
 
-		filename := fmt.Sprintf("%06d_", version)
-		entries, err := migrationFS.ReadDir("sql")
+		migrationFile, err := findMigrationFile(version, "up")
 		if err != nil {
-			return fmt.Errorf("list migration files: %w", err)
-		}
-		var migrationFile string
-		for _, entry := range entries {
-			if len(entry.Name()) >= len(filename) && entry.Name()[:len(filename)] == filename && len(entry.Name()) > len(".up.sql") && entry.Name()[len(entry.Name())-len(".up.sql"):] == ".up.sql" {
-				migrationFile = entry.Name()
-				break
-			}
-		}
-		if migrationFile == "" {
-			return fmt.Errorf("migration file not found for version %d", version)
+			return err
 		}
 
 		sqlBytes, err := migrationFS.ReadFile("sql/" + migrationFile)
@@ -126,6 +115,102 @@ func (r *Runner) Up(ctx context.Context) error {
 	return nil
 }
 
+func (r *Runner) Down(ctx context.Context, steps int) error {
+	if steps < 1 {
+		return fmt.Errorf("migration down steps must be positive")
+	}
+
+	migrationCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	conn, err := r.pool.Acquire(migrationCtx)
+	if err != nil {
+		return fmt.Errorf("acquire migration connection: %w", err)
+	}
+	defer conn.Release()
+
+	const lockKey = "backend-challenge-go:migrations"
+	if _, err := conn.Exec(migrationCtx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, lockKey)
+	}()
+
+	rows, err := conn.Query(migrationCtx, `
+		SELECT version
+		FROM schema_migrations
+		ORDER BY version DESC
+		LIMIT $1
+	`, steps)
+	if err != nil {
+		return fmt.Errorf("list applied migrations: %w", err)
+	}
+	versions := make([]int64, 0, steps)
+	for rows.Next() {
+		var version int64
+		if err := rows.Scan(&version); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan applied migration: %w", err)
+		}
+		versions = append(versions, version)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate applied migrations: %w", err)
+	}
+	rows.Close()
+
+	for _, version := range versions {
+		migrationFile, err := findMigrationFile(version, "down")
+		if err != nil {
+			return err
+		}
+		sqlBytes, err := migrationFS.ReadFile("sql/" + migrationFile)
+		if err != nil {
+			return fmt.Errorf("read migration file %s: %w", migrationFile, err)
+		}
+
+		tx, err := conn.Begin(migrationCtx)
+		if err != nil {
+			return fmt.Errorf("begin migration %d revert transaction: %w", version, err)
+		}
+		if _, err := tx.Exec(migrationCtx, `DELETE FROM schema_migrations WHERE version = $1`, version); err != nil {
+			_ = tx.Rollback(migrationCtx)
+			return fmt.Errorf("remove migration %d marker: %w", version, err)
+		}
+		if _, err := tx.Exec(migrationCtx, string(sqlBytes)); err != nil {
+			_ = tx.Rollback(migrationCtx)
+			return fmt.Errorf("revert migration %d: %w", version, err)
+		}
+		if err := tx.Commit(migrationCtx); err != nil {
+			return fmt.Errorf("commit migration %d revert: %w", version, err)
+		}
+	}
+
+	return nil
+}
+
+func findMigrationFile(version int64, direction string) (string, error) {
+	prefix := fmt.Sprintf("%06d_", version)
+	suffix := "." + direction + ".sql"
+	entries, err := migrationFS.ReadDir("sql")
+	if err != nil {
+		return "", fmt.Errorf("list migration files: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) >= len(prefix)+len(suffix) && name[:len(prefix)] == prefix && name[len(name)-len(suffix):] == suffix {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("migration %s file not found for version %d", direction, version)
+}
+
 func Run(ctx context.Context, pool *pgxpool.Pool) error {
 	return (&Runner{pool: pool}).Up(ctx)
+}
+
+func Revert(ctx context.Context, pool *pgxpool.Pool, steps int) error {
+	return (&Runner{pool: pool}).Down(ctx, steps)
 }

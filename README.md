@@ -57,6 +57,39 @@ Stop the environment:
 docker compose down
 ```
 
+## Migrations
+
+Migrations are versioned and applied on application startup. They can also be
+managed explicitly with the migration command:
+
+```powershell
+go run ./cmd/migrate -direction up
+go run ./cmd/migrate -direction down -steps 1
+```
+
+For the multi-instance checks, keep one PostgreSQL/LocalStack/Keycloak stack and
+scale only the API workers behind Nginx:
+
+```powershell
+docker compose up -d --build --scale application=3
+```
+
+The recommended verification commands are:
+
+```powershell
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+Integration tests use the real PostgreSQL, Keycloak and LocalStack services when
+run with `-tags=integration`.
+
+`down` reverts the latest applied versions in reverse order while holding the
+same PostgreSQL advisory lock used by startup migrations. Reverting the initial
+migration removes the migration table and the financial schema; starting the API
+again will apply the migrations again.
+
 ## Observability
 
 The API emits one JSON log entry per HTTP request and structured JSON entries
@@ -91,8 +124,9 @@ message layer. On failures, it schedules a retry with exponential backoff.
 The `wager-transactions.fifo` queue is the input command queue. Its messages
 have type `WagerTransactionRequested` and are processed by the same financial
 use case used by HTTP. The Outbox Publisher publishes the resulting events to
-the separate `wager-events.fifo` output queue. DLQ and reconciliation remain
-outside this stage.
+the separate `wager-events.fifo` output queue. The consumer uses the configured
+DLQ/redrive policy for poison messages, and the HTTP API exposes the read-only
+reconciliation endpoint described below.
 
 The transaction queue consumer is lifecycle-managed. It uses long polling,
 processes independent FIFO message groups in parallel, records durable Inbox
@@ -101,6 +135,12 @@ use case, and commits Inbox, wallet, wager transaction, ledger, and Outbox
 changes in one PostgreSQL transaction. It deletes a message only after that
 commit. Processing failures leave the message for SQS redelivery and the
 configured redrive policy.
+
+The command queue is FIFO. Producers should set `MessageGroupId` to the wallet
+ID (or another stable wallet-level aggregate key) so messages for the same wallet
+remain ordered while different wallets can be processed concurrently.
+`messageId` is the application-level Inbox identity; the SQS message ID is only the
+delivery identifier.
 
 Command messages use the following envelope:
 

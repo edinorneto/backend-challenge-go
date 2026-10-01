@@ -22,6 +22,8 @@ import (
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
+var ErrInvalidLedgerCursor = errors.New("invalid ledger cursor")
+
 var (
 	ErrWalletAlreadyExists         = errors.New("wallet already exists")
 	ErrWalletNotFound              = errors.New("wallet not found")
@@ -432,15 +434,15 @@ func (r *WalletRepo) GetLedger(ctx context.Context, walletID uuid.UUID, cursor s
 		}
 		parts := strings.Split(string(decoded), "|")
 		if len(parts) != 2 {
-			return nil, "", errors.New("invalid ledger cursor")
+			return nil, "", ErrInvalidLedgerCursor
 		}
 		cursorCreatedAt, err = time.Parse(time.RFC3339Nano, parts[0])
 		if err != nil {
-			return nil, "", errors.New("invalid ledger cursor")
+			return nil, "", ErrInvalidLedgerCursor
 		}
 		cursorID, err = uuid.Parse(parts[1])
 		if err != nil {
-			return nil, "", errors.New("invalid ledger cursor")
+			return nil, "", ErrInvalidLedgerCursor
 		}
 	}
 
