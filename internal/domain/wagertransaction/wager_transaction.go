@@ -79,6 +79,80 @@ type WagerTransaction struct {
 	processedAt *time.Time
 }
 
+type Rehydration struct {
+	ID                             uuid.UUID
+	ProviderID                     string
+	ExternalTransactionID          string
+	IdempotencyKey                 string
+	PayloadHash                    string
+	PlayerID                       uuid.UUID
+	WalletID                       uuid.UUID
+	RoundID                        string
+	GameID                         string
+	Kind                           Kind
+	Amount                         money.Money
+	Status                         Status
+	ReferenceExternalTransactionID string
+	ReferenceTransactionID         uuid.UUID
+	FailureCode                    string
+	ResultBalance                  money.Money
+	ResultWalletVersion            int64
+	CreatedAt                      time.Time
+	UpdatedAt                      time.Time
+	ProcessedAt                    *time.Time
+}
+
+func Rehydrate(data Rehydration) (*WagerTransaction, error) {
+	transaction, err := NewExternal(
+		data.ID, data.ProviderID, data.ExternalTransactionID, data.IdempotencyKey,
+		data.PayloadHash, data.PlayerID, data.WalletID, data.RoundID, data.GameID,
+		data.Kind, data.Amount, data.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if data.UpdatedAt.IsZero() {
+		return nil, ErrInvalidTransaction
+	}
+
+	switch data.Status {
+	case StatusPending:
+	case StatusPendingReference:
+		if err := transaction.MarkPendingReference(data.UpdatedAt); err != nil {
+			return nil, err
+		}
+	case StatusProcessed:
+		if err := transaction.MarkProcessed(data.ResultBalance, data.ResultWalletVersion, data.UpdatedAt); err != nil {
+			return nil, err
+		}
+	case StatusRejected:
+		if err := transaction.Reject(data.FailureCode, data.UpdatedAt); err != nil {
+			return nil, err
+		}
+	case StatusFailed:
+		if err := transaction.Fail(data.FailureCode, data.UpdatedAt); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, ErrInvalidTransactionStatus
+	}
+
+	transaction.referenceExternalTransactionID = data.ReferenceExternalTransactionID
+	transaction.referenceTransactionID = data.ReferenceTransactionID
+	transaction.createdAt = data.CreatedAt
+	transaction.updatedAt = data.UpdatedAt
+	if data.Status == StatusProcessed {
+		if data.ProcessedAt == nil || data.ProcessedAt.IsZero() {
+			return nil, ErrInvalidTransaction
+		}
+		processedAt := *data.ProcessedAt
+		transaction.processedAt = &processedAt
+	} else if data.ProcessedAt != nil {
+		return nil, ErrInvalidTransaction
+	}
+	return transaction, nil
+}
+
 func NewExternal(
 	id uuid.UUID,
 	providerID string,

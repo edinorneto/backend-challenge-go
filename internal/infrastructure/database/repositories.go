@@ -16,6 +16,7 @@ import (
 
 	"github.com/edinorneto/backend-challenge-go/internal/domain/ledger"
 	"github.com/edinorneto/backend-challenge-go/internal/domain/money"
+	"github.com/edinorneto/backend-challenge-go/internal/domain/wagertransaction"
 	"github.com/edinorneto/backend-challenge-go/internal/domain/wallet"
 	"github.com/edinorneto/backend-challenge-go/internal/messaging"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
@@ -566,6 +567,23 @@ func (r *WalletRepo) ProcessTransaction(
 	}
 
 	transactionID := uuid.New()
+	domainTransaction, err := wagertransaction.NewExternal(
+		transactionID,
+		req.ProviderID,
+		req.ExternalTransactionID,
+		req.IdempotencyKey,
+		req.PayloadHash,
+		req.PlayerID,
+		req.WalletID,
+		req.RoundID,
+		req.GameID,
+		wagertransaction.Kind(req.Kind),
+		req.Amount,
+		now,
+	)
+	if err != nil {
+		return ports.ProcessTransactionResult{}, err
+	}
 	insertResult, err := tx.Exec(
 		ctx,
 		`
@@ -659,6 +677,9 @@ func (r *WalletRepo) ProcessTransaction(
 		return ports.ProcessTransactionResult{}, err
 	}
 	if pending {
+		if err := domainTransaction.MarkPendingReference(now); err != nil {
+			return ports.ProcessTransactionResult{}, err
+		}
 		var walletExists bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM wallets WHERE id = $1)`, req.WalletID).Scan(&walletExists); err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("check wallet for pending reference: %w", err)
@@ -842,6 +863,9 @@ func (r *WalletRepo) ProcessTransaction(
 	}
 
 	if status == "PROCESSED" {
+		if err := domainTransaction.MarkProcessed(resultBalance, resultVersion, now); err != nil {
+			return ports.ProcessTransactionResult{}, err
+		}
 		if ledgerEntry != nil {
 			if _, err := tx.Exec(
 				ctx,
@@ -916,6 +940,9 @@ func (r *WalletRepo) ProcessTransaction(
 			}
 		}
 	} else {
+		if err := domainTransaction.Reject(failureCode, now); err != nil {
+			return ports.ProcessTransactionResult{}, err
+		}
 		_, err = tx.Exec(
 			ctx,
 			`
@@ -1107,12 +1134,14 @@ func (r *WalletRepo) retryPendingReferenceTx(ctx context.Context, tx pgx.Tx, tra
 		status              string
 		attempts            int
 		balanceCents        int64
+		createdAt           time.Time
+		updatedAt           time.Time
 	}
 	err := tx.QueryRow(ctx, `
 		SELECT provider_id, external_transaction_id, idempotency_key, payload_hash,
 		       player_id, wallet_id, round_id, game_id, kind, amount_cents, currency,
 		       reference_external_transaction_id, status, reference_attempts,
-		       COALESCE(result_balance_cents, 0)
+		       COALESCE(result_balance_cents, 0), created_at, updated_at
 		FROM wager_transactions
 		WHERE id = $1
 		FOR UPDATE
@@ -1120,7 +1149,7 @@ func (r *WalletRepo) retryPendingReferenceTx(ctx context.Context, tx pgx.Tx, tra
 		&req.providerID, &req.externalID, &req.idempotencyKey, &req.payloadHash,
 		&req.playerID, &req.walletID, &req.roundID, &req.gameID, &req.kind,
 		&req.amountCents, &req.currency, &req.referenceExternalID, &req.status,
-		&req.attempts, &req.balanceCents,
+		&req.attempts, &req.balanceCents, &req.createdAt, &req.updatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ports.ProcessTransactionResult{}, ErrReferenceNotFound
@@ -1140,6 +1169,26 @@ func (r *WalletRepo) retryPendingReferenceTx(ctx context.Context, tx pgx.Tx, tra
 	if err != nil {
 		return ports.ProcessTransactionResult{}, fmt.Errorf("rehydrate pending reference amount: %w", err)
 	}
+	domainTransaction, err := wagertransaction.Rehydrate(wagertransaction.Rehydration{
+		ID:                             transactionID,
+		ProviderID:                     req.providerID,
+		ExternalTransactionID:          req.externalID,
+		IdempotencyKey:                 req.idempotencyKey,
+		PayloadHash:                    req.payloadHash,
+		PlayerID:                       req.playerID,
+		WalletID:                       req.walletID,
+		RoundID:                        req.roundID,
+		GameID:                         req.gameID,
+		Kind:                           wagertransaction.Kind(req.kind),
+		Amount:                         amount,
+		Status:                         wagertransaction.StatusPendingReference,
+		ReferenceExternalTransactionID: req.referenceExternalID,
+		CreatedAt:                      req.createdAt,
+		UpdatedAt:                      req.updatedAt,
+	})
+	if err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("rehydrate pending reference transaction: %w", err)
+	}
 	reversalReq := ports.ProcessTransactionRequest{
 		ProviderID: req.providerID, ExternalTransactionID: req.externalID,
 		IdempotencyKey: req.idempotencyKey, PayloadHash: req.payloadHash,
@@ -1152,6 +1201,9 @@ func (r *WalletRepo) retryPendingReferenceTx(ctx context.Context, tx pgx.Tx, tra
 		return ports.ProcessTransactionResult{}, err
 	}
 	if pending {
+		if err := domainTransaction.MarkPendingReference(time.Now().UTC()); err != nil {
+			return ports.ProcessTransactionResult{}, err
+		}
 		result, err := persistReferenceRetry(ctx, tx, transactionID, req.walletID, req.providerID, req.kind, req.referenceExternalID, req.attempts, req.balanceCents, req.currency)
 		if err != nil {
 			return ports.ProcessTransactionResult{}, err
@@ -1198,6 +1250,13 @@ func (r *WalletRepo) retryPendingReferenceTx(ctx context.Context, tx pgx.Tx, tra
 		status = "REJECTED"
 	}
 	now := time.Now().UTC()
+	if status == "PROCESSED" {
+		if err := domainTransaction.MarkProcessed(resultBalance, resultVersion, now); err != nil {
+			return ports.ProcessTransactionResult{}, err
+		}
+	} else if err := domainTransaction.Reject(failureCode, now); err != nil {
+		return ports.ProcessTransactionResult{}, err
+	}
 	if status == "PROCESSED" && ledgerEntry != nil {
 		if _, err := tx.Exec(ctx, `UPDATE wallets SET balance_cents = $1, version = $2, updated_at = $3 WHERE id = $4`, resultBalance.AmountCents(), resultVersion, now, req.walletID); err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("update retry wallet balance: %w", err)

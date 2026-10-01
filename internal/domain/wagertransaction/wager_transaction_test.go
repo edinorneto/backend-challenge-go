@@ -316,3 +316,71 @@ func TestOpeningIsInternalOnly(t *testing.T) {
 		t.Fatalf("unexpected opening transaction state: source=%s kind=%s status=%s", tx.Source(), tx.Kind(), tx.Status())
 	}
 }
+
+func TestTerminalStatesRejectEveryBusinessTransition(t *testing.T) {
+	amount, err := money.ParseExternal("25.00", "BRL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tests := []struct {
+		name  string
+		apply func(*WagerTransaction) error
+	}{
+		{"processed", func(tx *WagerTransaction) error { return tx.MarkProcessed(amount, 1, now) }},
+		{"rejected", func(tx *WagerTransaction) error { return tx.Reject("business_rejection", now) }},
+		{"failed", func(tx *WagerTransaction) error { return tx.Fail("permanent_failure", now) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tx, err := NewExternal(uuid.New(), "provider-a", test.name, "key-"+test.name, "hash",
+				uuid.New(), uuid.New(), "round", "game", KindBet, amount, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := test.apply(tx); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.MarkPendingReference(now); err != ErrTerminalTransaction {
+				t.Fatalf("expected pending transition to be rejected, got %v", err)
+			}
+			if err := tx.MarkProcessed(amount, 2, now); err != ErrTerminalTransaction {
+				t.Fatalf("expected processed transition to be rejected, got %v", err)
+			}
+			if err := tx.Reject("another", now); err != ErrTerminalTransaction {
+				t.Fatalf("expected rejected transition to be rejected, got %v", err)
+			}
+			if err := tx.Fail("another", now); err != ErrTerminalTransaction {
+				t.Fatalf("expected failed transition to be rejected, got %v", err)
+			}
+		})
+	}
+}
+
+func TestRehydrateRestoresStateWithoutSideEffects(t *testing.T) {
+	amount, err := money.ParseExternal("25.00", "BRL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	updatedAt := createdAt.Add(time.Minute)
+	processedAt := updatedAt.Add(time.Second)
+	tx, err := Rehydrate(Rehydration{
+		ID: uuid.New(), ProviderID: "provider-a", ExternalTransactionID: "external",
+		IdempotencyKey: "key", PayloadHash: "hash", PlayerID: uuid.New(), WalletID: uuid.New(),
+		RoundID: "round", GameID: "game", Kind: KindBet, Amount: amount,
+		Status: StatusProcessed, ResultBalance: amount, ResultWalletVersion: 2,
+		CreatedAt: createdAt, UpdatedAt: updatedAt, ProcessedAt: &processedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.Status() != StatusProcessed || tx.CreatedAt() != createdAt ||
+		tx.UpdatedAt() != updatedAt || tx.ProcessedAt() == nil ||
+		!tx.ProcessedAt().Equal(processedAt) {
+		t.Fatalf("rehydrated transaction lost persisted state")
+	}
+	if err := tx.MarkProcessed(amount, 3, time.Now().UTC()); err != ErrTerminalTransaction {
+		t.Fatalf("expected rehydrated terminal state to remain terminal, got %v", err)
+	}
+}
