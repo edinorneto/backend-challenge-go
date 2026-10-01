@@ -92,3 +92,9 @@ restart, and multiple instances can process different pending rows safely.
 
 The Inbox is the durable protection against duplicate delivery and does not
 rely on SQS deduplication alone.
+
+The application can run as multiple independent Compose instances. Each
+instance has its own memory, connection pool, consumers, publisher, and
+pending-reference worker, while financial state is shared through PostgreSQL
+and SQS. An Nginx reverse proxy provides the single external HTTP endpoint and
+forwards requests to the scaled application service.
