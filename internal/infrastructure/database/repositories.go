@@ -16,6 +16,7 @@ import (
 	"github.com/edinorneto/backend-challenge-go/internal/domain/ledger"
 	"github.com/edinorneto/backend-challenge-go/internal/domain/money"
 	"github.com/edinorneto/backend-challenge-go/internal/domain/wallet"
+	"github.com/edinorneto/backend-challenge-go/internal/messaging"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
@@ -215,21 +216,25 @@ func (r *WalletRepo) Create(ctx context.Context, w *wallet.Wallet) error {
 		return fmt.Errorf("insert opening ledger: %w", err)
 	}
 
-	wagerPayload, err := json.Marshal(map[string]any{
-		"transactionId": transactionID,
-		"walletId":      w.ID(),
-		"playerId":      w.PlayerID(),
-		"kind":          "OPENING",
-		"status":        "PROCESSED",
-		"amount": map[string]string{
-			"amount":   w.Balance().String(),
-			"currency": w.Currency(),
+	wagerEvent := messaging.NewWagerTransactionProcessed(messaging.WagerTransactionProcessedData{
+		TransactionID: transactionID,
+		WalletID:      w.ID(),
+		PlayerID:      w.PlayerID(),
+		Kind:          "OPENING",
+		Status:        "PROCESSED",
+		Amount: messaging.MoneyData{
+			Amount:   w.Balance().String(),
+			Currency: w.Currency(),
 		},
-		"result": map[string]any{
-			"balance": w.Balance().String(),
-			"version": w.Version(),
+		Result: messaging.TransactionResultData{
+			Balance: messaging.MoneyData{
+				Amount:   w.Balance().String(),
+				Currency: w.Currency(),
+			},
+			Version: w.Version(),
 		},
 	})
+	wagerPayload, err := json.Marshal(wagerEvent.Data)
 	if err != nil {
 		return fmt.Errorf("marshal wager event: %w", err)
 	}
@@ -255,12 +260,12 @@ func (r *WalletRepo) Create(ctx context.Context, w *wallet.Wallet) error {
 			$1,
 			'wallet',
 			$2,
-			'WagerTransactionProcessed',
+			$5,
 			$3,
 			NULL,
 			$4,
-			1,
-			$5,
+			$6,
+			$7,
 			'PENDING',
 			0,
 			$4
@@ -270,6 +275,8 @@ func (r *WalletRepo) Create(ctx context.Context, w *wallet.Wallet) error {
 		w.ID(),
 		transactionID,
 		now,
+		wagerEvent.EventType,
+		wagerEvent.Version,
 		wagerPayload,
 	)
 
@@ -277,15 +284,20 @@ func (r *WalletRepo) Create(ctx context.Context, w *wallet.Wallet) error {
 		return fmt.Errorf("insert wager outbox event: %w", err)
 	}
 
-	walletPayload, err := json.Marshal(map[string]any{
-		"walletId": w.ID(),
-		"playerId": w.PlayerID(),
-		"balance": map[string]string{
-			"amount":   w.Balance().String(),
-			"currency": w.Currency(),
+	walletEvent := messaging.NewWalletBalanceChanged(messaging.WalletBalanceChangedData{
+		WalletID:      w.ID(),
+		TransactionID: transactionID,
+		Direction:     "CREDIT",
+		Money: messaging.MoneyData{
+			Amount:   w.Balance().String(),
+			Currency: w.Currency(),
 		},
-		"version": w.Version(),
+		BalanceBefore:   messaging.MoneyData{Amount: "0.00", Currency: w.Currency()},
+		BalanceAfter:    messaging.MoneyData{Amount: w.Balance().String(), Currency: w.Currency()},
+		WalletVersion:   w.Version(),
+		PreviousVersion: 0,
 	})
+	walletPayload, err := json.Marshal(walletEvent.Data)
 	if err != nil {
 		return fmt.Errorf("marshal wallet event: %w", err)
 	}
@@ -311,12 +323,12 @@ func (r *WalletRepo) Create(ctx context.Context, w *wallet.Wallet) error {
 			$1,
 			'wallet',
 			$2,
-			'WalletBalanceChanged',
+			$5,
 			$3,
 			NULL,
 			$4,
-			1,
-			$5,
+			$6,
+			$7,
 			'PENDING',
 			0,
 			$4
@@ -326,6 +338,8 @@ func (r *WalletRepo) Create(ctx context.Context, w *wallet.Wallet) error {
 		w.ID(),
 		transactionID,
 		now,
+		walletEvent.EventType,
+		walletEvent.Version,
 		walletPayload,
 	)
 
@@ -762,11 +776,11 @@ func (r *WalletRepo) ProcessTransaction(
 			return ports.ProcessTransactionResult{}, fmt.Errorf("update processed wager transaction: %w", err)
 		}
 
-		if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, "WagerTransactionProcessed", buildProcessedPayload(transactionID, req, resultBalance, resultVersion)); err != nil {
+		if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, messaging.NewWagerTransactionProcessed(buildProcessedPayload(transactionID, req, resultBalance, resultVersion))); err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("insert processed outbox event: %w", err)
 		}
 		if ledgerEntry != nil {
-			if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, "WalletBalanceChanged", buildWalletBalanceChangedPayload(req.WalletID, transactionID, string(ledgerEntry.Direction()), req.Amount, walletBalance, resultBalance, w.Version(), resultVersion)); err != nil {
+			if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, messaging.NewWalletBalanceChanged(buildWalletBalanceChangedPayload(req.WalletID, transactionID, string(ledgerEntry.Direction()), req.Amount, walletBalance, resultBalance, w.Version(), resultVersion))); err != nil {
 				return ports.ProcessTransactionResult{}, fmt.Errorf("insert wallet balance outbox event: %w", err)
 			}
 		}
@@ -792,7 +806,7 @@ func (r *WalletRepo) ProcessTransaction(
 		if err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("update rejected wager transaction: %w", err)
 		}
-		if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, "WagerTransactionRejected", buildRejectedPayload(transactionID, req, failureCode, walletBalance, w.Version())); err != nil {
+		if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, messaging.NewWagerTransactionRejected(buildRejectedPayload(transactionID, req, failureCode, walletBalance, w.Version()))); err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("insert rejected outbox event: %w", err)
 		}
 	}
@@ -952,11 +966,11 @@ func (r *WalletRepo) RetryPendingReference(ctx context.Context, transactionID uu
 		`, reference.id, resultBalance.AmountCents(), resultVersion, now, transactionID); err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("update retried wager transaction: %w", err)
 		}
-		if err := insertOutboxEvent(ctx, tx, now, transactionID, req.walletID, "WagerTransactionProcessed", buildProcessedPayload(transactionID, reversalReq, resultBalance, resultVersion)); err != nil {
+		if err := insertOutboxEvent(ctx, tx, now, transactionID, req.walletID, messaging.NewWagerTransactionProcessed(buildProcessedPayload(transactionID, reversalReq, resultBalance, resultVersion))); err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("insert retried processed event: %w", err)
 		}
 		if ledgerEntry != nil {
-			if err := insertOutboxEvent(ctx, tx, now, transactionID, req.walletID, "WalletBalanceChanged", buildWalletBalanceChangedPayload(req.walletID, transactionID, string(ledgerEntry.Direction()), reversalReq.Amount, walletBalance, resultBalance, walletRow.version, resultVersion)); err != nil {
+			if err := insertOutboxEvent(ctx, tx, now, transactionID, req.walletID, messaging.NewWalletBalanceChanged(buildWalletBalanceChangedPayload(req.walletID, transactionID, string(ledgerEntry.Direction()), reversalReq.Amount, walletBalance, resultBalance, walletRow.version, resultVersion))); err != nil {
 				return ports.ProcessTransactionResult{}, fmt.Errorf("insert retried balance event: %w", err)
 			}
 		}
@@ -970,7 +984,7 @@ func (r *WalletRepo) RetryPendingReference(ctx context.Context, transactionID uu
 		`, failureCode, walletBalance.AmountCents(), walletRow.version, now, transactionID); err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("update rejected retried wager transaction: %w", err)
 		}
-		if err := insertOutboxEvent(ctx, tx, now, transactionID, req.walletID, "WagerTransactionRejected", buildRejectedPayload(transactionID, reversalReq, failureCode, walletBalance, walletRow.version)); err != nil {
+		if err := insertOutboxEvent(ctx, tx, now, transactionID, req.walletID, messaging.NewWagerTransactionRejected(buildRejectedPayload(transactionID, reversalReq, failureCode, walletBalance, walletRow.version))); err != nil {
 			return ports.ProcessTransactionResult{}, fmt.Errorf("insert retried rejection event: %w", err)
 		}
 	}
@@ -1146,13 +1160,11 @@ func persistPendingReference(
 	}
 
 	failureCode := failureReferenceNotFound
-	eventType := "WagerTransactionPendingReference"
 	if req.ReferenceExternalTransactionID != "" {
 		failureCode = failureReferencePending
 	}
 	if status == "REJECTED" {
 		failureCode = failureReferenceNotFound
-		eventType = "WagerTransactionRejected"
 	}
 
 	zero, err := money.Zero(req.Amount.Currency())
@@ -1184,18 +1196,28 @@ func persistPendingReference(
 		return ports.ProcessTransactionResult{}, fmt.Errorf("persist pending reference: %w", err)
 	}
 
-	payload := map[string]any{
-		"transactionId":                  transactionID,
-		"walletId":                       req.WalletID,
-		"providerId":                     req.ProviderID,
-		"kind":                           req.Kind,
-		"status":                         status,
-		"failureCode":                    failureCode,
-		"referenceExternalTransactionId": req.ReferenceExternalTransactionID,
-		"referenceAttempts":              attempts,
-		"nextAttemptAt":                  nextAttempt.UTC().Format(time.RFC3339),
+	var event messaging.Event
+	if status == "REJECTED" {
+		rejected := buildRejectedPayload(transactionID, req, failureCode, zero, 0)
+		rejected.ProviderID = req.ProviderID
+		rejected.ReferenceExternalTransactionID = req.ReferenceExternalTransactionID
+		rejected.ReferenceAttempts = attempts
+		rejected.NextAttemptAt = nextAttempt.UTC().Format(time.RFC3339)
+		event = messaging.NewWagerTransactionRejected(rejected)
+	} else {
+		event = messaging.NewWagerTransactionPendingReference(messaging.WagerTransactionPendingReferenceData{
+			TransactionID:                  transactionID,
+			WalletID:                       req.WalletID,
+			ProviderID:                     req.ProviderID,
+			Kind:                           req.Kind,
+			Status:                         status,
+			FailureCode:                    failureCode,
+			ReferenceExternalTransactionID: req.ReferenceExternalTransactionID,
+			ReferenceAttempts:              attempts,
+			NextAttemptAt:                  nextAttempt.UTC().Format(time.RFC3339),
+		})
 	}
-	if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, eventType, payload); err != nil {
+	if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, event); err != nil {
 		return ports.ProcessTransactionResult{}, fmt.Errorf("insert pending reference outbox event: %w", err)
 	}
 
@@ -1365,11 +1387,9 @@ func persistReferenceRetry(
 	now := time.Now().UTC()
 	attempts := currentAttempts + 1
 	status := "PENDING_REFERENCE"
-	eventType := "WagerTransactionPendingReference"
 	failureCode := failureReferencePending
 	if attempts > maxReferenceAttempts {
 		status = "REJECTED"
-		eventType = "WagerTransactionRejected"
 		failureCode = failureReferenceNotFound
 	}
 	nextAttempt := nextReferenceAttempt(now, attempts)
@@ -1381,13 +1401,41 @@ func persistReferenceRetry(
 	`, status, failureCode, attempts, nextAttempt, now, transactionID); err != nil {
 		return ports.ProcessTransactionResult{}, fmt.Errorf("update reference retry: %w", err)
 	}
-	payload := map[string]any{
-		"transactionId": transactionID, "walletId": walletID, "providerId": providerID,
-		"kind": kind, "status": status, "failureCode": failureCode,
-		"referenceExternalTransactionId": referenceExternalID,
-		"referenceAttempts":              attempts, "nextAttemptAt": nextAttempt.UTC().Format(time.RFC3339),
+	var event messaging.Event
+	if status == "REJECTED" {
+		balance, err := money.FromCents(balanceCents, currency)
+		if err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("rehydrate rejected reference balance: %w", err)
+		}
+		event = messaging.NewWagerTransactionRejected(messaging.WagerTransactionRejectedData{
+			TransactionID:                  transactionID,
+			WalletID:                       walletID,
+			ProviderID:                     providerID,
+			Kind:                           kind,
+			Status:                         status,
+			FailureCode:                    failureCode,
+			ReferenceExternalTransactionID: referenceExternalID,
+			ReferenceAttempts:              attempts,
+			NextAttemptAt:                  nextAttempt.UTC().Format(time.RFC3339),
+			Result: messaging.TransactionResultData{
+				Balance: messaging.MoneyData{Amount: balance.String(), Currency: balance.Currency()},
+				Version: 0,
+			},
+		})
+	} else {
+		event = messaging.NewWagerTransactionPendingReference(messaging.WagerTransactionPendingReferenceData{
+			TransactionID:                  transactionID,
+			WalletID:                       walletID,
+			ProviderID:                     providerID,
+			Kind:                           kind,
+			Status:                         status,
+			FailureCode:                    failureCode,
+			ReferenceExternalTransactionID: referenceExternalID,
+			ReferenceAttempts:              attempts,
+			NextAttemptAt:                  nextAttempt.UTC().Format(time.RFC3339),
+		})
 	}
-	if err := insertOutboxEvent(ctx, tx, now, transactionID, walletID, eventType, payload); err != nil {
+	if err := insertOutboxEvent(ctx, tx, now, transactionID, walletID, event); err != nil {
 		return ports.ProcessTransactionResult{}, fmt.Errorf("insert reference retry event: %w", err)
 	}
 	balance, err := money.FromCents(balanceCents, currency)
@@ -1425,17 +1473,16 @@ func insertOutboxEvent(
 	now time.Time,
 	transactionID uuid.UUID,
 	walletID uuid.UUID,
-	eventType string,
-	payload map[string]any,
+	event messaging.Event,
 ) error {
-	body, err := json.Marshal(payload)
+	body, err := json.Marshal(event.Data)
 	if err != nil {
 		return err
 	}
 
 	aggregateType := "wager_transaction"
 	aggregateID := transactionID
-	if eventType == "WalletBalanceChanged" {
+	if event.EventType == "WalletBalanceChanged" {
 		aggregateType = "wallet"
 		aggregateID = walletID
 	}
@@ -1457,14 +1504,15 @@ func insertOutboxEvent(
 			attempts,
 			next_attempt_at
 		)
-		VALUES ($1,$2,$3,$4,$5,NULL,$6,1,$7,'PENDING',0,$6)
+		VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,$8,'PENDING',0,$6)
 		`,
 		uuid.New(),
 		aggregateType,
 		aggregateID,
-		eventType,
+		event.EventType,
 		transactionID,
 		now,
+		event.Version,
 		body,
 	)
 	if err != nil {
@@ -1479,23 +1527,23 @@ func buildProcessedPayload(
 	req ports.ProcessTransactionRequest,
 	resultBalance money.Money,
 	resultVersion int64,
-) map[string]any {
-	return map[string]any{
-		"transactionId": transactionID,
-		"walletId":      req.WalletID,
-		"playerId":      req.PlayerID,
-		"kind":          req.Kind,
-		"status":        "PROCESSED",
-		"amount": map[string]string{
-			"amount":   req.Amount.String(),
-			"currency": req.Amount.Currency(),
+) messaging.WagerTransactionProcessedData {
+	return messaging.WagerTransactionProcessedData{
+		TransactionID: transactionID,
+		WalletID:      req.WalletID,
+		PlayerID:      req.PlayerID,
+		Kind:          req.Kind,
+		Status:        "PROCESSED",
+		Amount: messaging.MoneyData{
+			Amount:   req.Amount.String(),
+			Currency: req.Amount.Currency(),
 		},
-		"result": map[string]any{
-			"balance": map[string]string{
-				"amount":   resultBalance.String(),
-				"currency": resultBalance.Currency(),
+		Result: messaging.TransactionResultData{
+			Balance: messaging.MoneyData{
+				Amount:   resultBalance.String(),
+				Currency: resultBalance.Currency(),
 			},
-			"version": resultVersion,
+			Version: resultVersion,
 		},
 	}
 }
@@ -1509,25 +1557,25 @@ func buildWalletBalanceChangedPayload(
 	balanceAfter money.Money,
 	currentVersion int64,
 	resultVersion int64,
-) map[string]any {
-	return map[string]any{
-		"walletId":      walletID,
-		"transactionId": transactionID,
-		"direction":     direction,
-		"money": map[string]string{
-			"amount":   amount.String(),
-			"currency": amount.Currency(),
+) messaging.WalletBalanceChangedData {
+	return messaging.WalletBalanceChangedData{
+		WalletID:      walletID,
+		TransactionID: transactionID,
+		Direction:     direction,
+		Money: messaging.MoneyData{
+			Amount:   amount.String(),
+			Currency: amount.Currency(),
 		},
-		"balanceBefore": map[string]string{
-			"amount":   balanceBefore.String(),
-			"currency": balanceBefore.Currency(),
+		BalanceBefore: messaging.MoneyData{
+			Amount:   balanceBefore.String(),
+			Currency: balanceBefore.Currency(),
 		},
-		"balanceAfter": map[string]string{
-			"amount":   balanceAfter.String(),
-			"currency": balanceAfter.Currency(),
+		BalanceAfter: messaging.MoneyData{
+			Amount:   balanceAfter.String(),
+			Currency: balanceAfter.Currency(),
 		},
-		"walletVersion":   resultVersion,
-		"previousVersion": currentVersion,
+		WalletVersion:   resultVersion,
+		PreviousVersion: currentVersion,
 	}
 }
 
@@ -1537,24 +1585,24 @@ func buildRejectedPayload(
 	failureCode string,
 	balance money.Money,
 	version int64,
-) map[string]any {
-	return map[string]any{
-		"transactionId": transactionID,
-		"walletId":      req.WalletID,
-		"playerId":      req.PlayerID,
-		"kind":          req.Kind,
-		"status":        "REJECTED",
-		"failureCode":   failureCode,
-		"amount": map[string]string{
-			"amount":   req.Amount.String(),
-			"currency": req.Amount.Currency(),
+) messaging.WagerTransactionRejectedData {
+	return messaging.WagerTransactionRejectedData{
+		TransactionID: transactionID,
+		WalletID:      req.WalletID,
+		PlayerID:      req.PlayerID,
+		Kind:          req.Kind,
+		Status:        "REJECTED",
+		FailureCode:   failureCode,
+		Amount: messaging.MoneyData{
+			Amount:   req.Amount.String(),
+			Currency: req.Amount.Currency(),
 		},
-		"result": map[string]any{
-			"balance": map[string]string{
-				"amount":   balance.String(),
-				"currency": balance.Currency(),
+		Result: messaging.TransactionResultData{
+			Balance: messaging.MoneyData{
+				Amount:   balance.String(),
+				Currency: balance.Currency(),
 			},
-			"version": version,
+			Version: version,
 		},
 	}
 }

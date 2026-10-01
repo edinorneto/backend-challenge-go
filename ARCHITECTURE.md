@@ -54,15 +54,20 @@ envelope:
 ```json
 {
   "eventId": "...",
-  "type": "WalletBalanceChanged",
+  "eventType": "WalletBalanceChanged",
   "aggregateId": "...",
   "correlationId": "...",
   "causationId": "...",
-  "timestamp": "2025-01-01T00:00:00Z",
+  "occurredAt": "2026-09-30T12:00:00Z",
   "version": 1,
-  "payload": { ... }
+  "data": { ... }
 }
 ```
+
+The `eventId` is stable across publication retries, `eventType` identifies the
+concrete event, and `occurredAt` represents when the event occurred rather than
+when it was delivered to SQS. The `data` field contains the immutable snapshot
+persisted by the outbox.
 
 The command SQS FIFO queue receives `WagerTransactionRequested` messages. The
 consumer long-polls the queue, groups messages by `MessageGroupId`, records

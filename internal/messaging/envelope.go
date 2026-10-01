@@ -12,13 +12,13 @@ var ErrInvalidEventEnvelope = errors.New("invalid event envelope")
 
 type EventEnvelope struct {
 	EventID       uuid.UUID       `json:"eventId"`
-	Type          string          `json:"type"`
+	EventType     string          `json:"eventType"`
 	AggregateID   uuid.UUID       `json:"aggregateId"`
 	CorrelationID uuid.UUID       `json:"correlationId"`
 	CausationID   *uuid.UUID      `json:"causationId,omitempty"`
-	Timestamp     time.Time       `json:"timestamp"`
+	OccurredAt    time.Time       `json:"occurredAt"`
 	Version       int             `json:"version"`
-	Payload       json.RawMessage `json:"payload"`
+	Data          json.RawMessage `json:"data"`
 }
 
 func (e EventEnvelope) MarshalJSON() ([]byte, error) {
@@ -27,7 +27,7 @@ func (e EventEnvelope) MarshalJSON() ([]byte, error) {
 }
 
 func (e EventEnvelope) Validate() error {
-	if e.EventID == uuid.Nil || e.Type == "" || e.AggregateID == uuid.Nil ||
+	if e.EventID == uuid.Nil || e.EventType == "" || e.AggregateID == uuid.Nil ||
 		e.CorrelationID == uuid.Nil || e.Version < 1 {
 		return ErrInvalidEventEnvelope
 	}

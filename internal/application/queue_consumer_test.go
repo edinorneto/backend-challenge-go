@@ -119,7 +119,7 @@ func (r *fakeInboxRepository) Process(ctx context.Context, consumerName, message
 }
 
 func validBody() string {
-	return `{"eventId":"11111111-1111-1111-1111-111111111111","type":"WalletBalanceChanged","aggregateId":"22222222-2222-2222-2222-222222222222","correlationId":"33333333-3333-3333-3333-333333333333","timestamp":"2026-09-30T12:00:00Z","version":1,"payload":{}}`
+	return `{"eventId":"11111111-1111-1111-1111-111111111111","eventType":"WalletBalanceChanged","aggregateId":"22222222-2222-2222-2222-222222222222","correlationId":"33333333-3333-3333-3333-333333333333","occurredAt":"2026-09-30T12:00:00Z","version":1,"data":{}}`
 }
 
 func validCommandBody() string {

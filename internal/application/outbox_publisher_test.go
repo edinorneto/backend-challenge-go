@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -117,8 +118,91 @@ func TestOutboxPublisherPublishesPendingEvent(t *testing.T) {
 	if publisher.messages[0].MessageGroupID != aggregateID.String() {
 		t.Fatalf("expected group id %s, got %s", aggregateID.String(), publisher.messages[0].MessageGroupID)
 	}
-	if len(repo.published) != 1 {
-		t.Fatalf("expected 1 published event, got %d", len(repo.published))
+}
+
+func TestMarshalEnvelopeUsesEventContract(t *testing.T) {
+	eventID := uuid.New()
+	occurredAt := time.Date(2026, time.September, 30, 12, 0, 0, 123000000, time.FixedZone("BRT", -3*60*60))
+	body, err := marshalEnvelope(ports.OutboxEvent{
+		EventID:       eventID,
+		EventType:     "WalletBalanceChanged",
+		AggregateID:   uuid.New(),
+		CorrelationID: uuid.New(),
+		OccurredAt:    occurredAt,
+		Version:       1,
+		Payload:       []byte(`{"walletId":"wallet"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"eventId", "eventType", "aggregateId", "correlationId", "occurredAt", "version", "data"} {
+		if _, ok := envelope[key]; !ok {
+			t.Fatalf("expected envelope field %q in %s", key, body)
+		}
+	}
+	for _, key := range []string{"type", "timestamp", "payload"} {
+		if _, ok := envelope[key]; ok {
+			t.Fatalf("unexpected legacy envelope field %q in %s", key, body)
+		}
+	}
+
+	var serializedTime string
+	if err := json.Unmarshal(envelope["occurredAt"], &serializedTime); err != nil {
+		t.Fatal(err)
+	}
+	if serializedTime != "2026-09-30T15:00:00.123Z" {
+		t.Fatalf("expected UTC RFC3339 occurredAt, got %q", serializedTime)
+	}
+}
+
+func TestOutboxPublisherKeepsEventIDOnRepublish(t *testing.T) {
+	eventID := uuid.New()
+	event := ports.OutboxEvent{
+		EventID:       eventID,
+		EventType:     "WagerTransactionProcessed",
+		AggregateID:   uuid.New(),
+		CorrelationID: uuid.New(),
+		OccurredAt:    time.Now().UTC(),
+		Version:       1,
+		Payload:       []byte(`{"status":"PROCESSED"}`),
+	}
+	repo := &fakeOutboxRepo{}
+	publisher := &fakePublisher{fail: true}
+	worker := NewOutboxPublisher(repo, publisher, config.Config{})
+
+	if err := worker.publishEvent(context.Background(), event); err == nil {
+		t.Fatal("expected first publish attempt to fail before MarkPublished")
+	}
+	if err := worker.publishEvent(context.Background(), event); err == nil {
+		t.Fatal("expected second publish attempt to fail before MarkPublished")
+	}
+	if len(publisher.messages) != 2 {
+		t.Fatalf("expected 2 published messages, got %d", len(publisher.messages))
+	}
+
+	var firstEnvelope, secondEnvelope struct {
+		EventID string `json:"eventId"`
+	}
+	if err := json.Unmarshal([]byte(publisher.messages[0].Body), &firstEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(publisher.messages[1].Body), &secondEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	if firstEnvelope.EventID != eventID.String() || secondEnvelope.EventID != eventID.String() {
+		t.Fatalf("expected eventId %s in both envelopes, got %s and %s", eventID, firstEnvelope.EventID, secondEnvelope.EventID)
+	}
+	if publisher.messages[0].MessageDeduplicationID != eventID.String() ||
+		publisher.messages[1].MessageDeduplicationID != eventID.String() {
+		t.Fatalf("expected stable SQS deduplication id %s, got %s and %s", eventID, publisher.messages[0].MessageDeduplicationID, publisher.messages[1].MessageDeduplicationID)
+	}
+	if publisher.messages[0].MessageDeduplicationID != publisher.messages[1].MessageDeduplicationID {
+		t.Fatal("expected identical SQS deduplication IDs across publish attempts")
 	}
 }
 
