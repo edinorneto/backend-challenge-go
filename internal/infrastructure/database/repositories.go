@@ -780,7 +780,7 @@ func (r *WalletRepo) ProcessTransaction(
 			return ports.ProcessTransactionResult{}, fmt.Errorf("insert processed outbox event: %w", err)
 		}
 		if ledgerEntry != nil {
-			if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, messaging.NewWalletBalanceChanged(buildWalletBalanceChangedPayload(req.WalletID, transactionID, string(ledgerEntry.Direction()), req.Amount, walletBalance, resultBalance, w.Version(), resultVersion))); err != nil {
+			if err := insertOutboxEvent(ctx, tx, now, transactionID, req.WalletID, messaging.NewWalletBalanceChanged(buildWalletBalanceChangedPayload(req.WalletID, transactionID, string(ledgerEntry.Direction()), req.Amount, walletBalance, resultBalance, walletRow.version, resultVersion))); err != nil {
 				return ports.ProcessTransactionResult{}, fmt.Errorf("insert wallet balance outbox event: %w", err)
 			}
 		}

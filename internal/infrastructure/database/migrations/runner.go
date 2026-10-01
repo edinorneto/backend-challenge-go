@@ -38,7 +38,22 @@ func (r *Runner) Up(ctx context.Context) error {
 	migrationCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	_, err := r.pool.Exec(migrationCtx, `
+	conn, err := r.pool.Acquire(migrationCtx)
+	if err != nil {
+		return fmt.Errorf("acquire migration connection: %w", err)
+	}
+
+	defer conn.Release()
+
+	const lockKey = "backend-challenge-go:migrations"
+	if _, err := conn.Exec(migrationCtx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, lockKey)
+	}()
+
+	_, err = conn.Exec(migrationCtx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version BIGINT PRIMARY KEY,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -50,7 +65,7 @@ func (r *Runner) Up(ctx context.Context) error {
 
 	for version := int64(1); version <= 3; version++ {
 		var applied bool
-		err = r.pool.QueryRow(
+		err = conn.QueryRow(
 			migrationCtx,
 			`SELECT EXISTS (
 				SELECT 1
@@ -87,7 +102,7 @@ func (r *Runner) Up(ctx context.Context) error {
 			return fmt.Errorf("read migration file %s: %w", migrationFile, err)
 		}
 
-		tx, err := r.pool.Begin(migrationCtx)
+		tx, err := conn.Begin(migrationCtx)
 		if err != nil {
 			return fmt.Errorf("begin migration %d transaction: %w", version, err)
 		}
@@ -109,4 +124,8 @@ func (r *Runner) Up(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func Run(ctx context.Context, pool *pgxpool.Pool) error {
+	return (&Runner{pool: pool}).Up(ctx)
 }

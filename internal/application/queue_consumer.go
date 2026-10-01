@@ -140,6 +140,7 @@ func (c *QueueConsumer) processBatch(ctx context.Context, messages []ports.Queue
 			for _, message := range group {
 				if err := c.processMessage(ctx, message); err != nil {
 					errCh <- err
+					return
 				}
 			}
 		}()

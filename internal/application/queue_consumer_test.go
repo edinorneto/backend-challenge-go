@@ -253,6 +253,68 @@ func TestQueueConsumerProcessesDifferentGroupsInParallel(t *testing.T) {
 	}
 }
 
+func TestQueueConsumerStopsOnlyFailedMessageGroup(t *testing.T) {
+	receiver := &fakeQueueReceiver{}
+	inbox := &groupFailureInbox{failedMessageID: "a1"}
+	processed := make(chan string, 3)
+	consumer := NewQueueConsumer(receiver, inbox, func(_ context.Context, payload []byte) error {
+		processed <- string(payload)
+		return nil
+	}, QueueConsumerConfig{Name: "test"})
+
+	messages := []ports.QueueMessage{
+		{MessageID: "a1", ReceiptHandle: "ra1", Body: validBody(), MessageGroup: "group-a"},
+		{MessageID: "a2", ReceiptHandle: "ra2", Body: validBody(), MessageGroup: "group-a"},
+		{MessageID: "b1", ReceiptHandle: "rb1", Body: validBody(), MessageGroup: "group-b"},
+		{MessageID: "b2", ReceiptHandle: "rb2", Body: validBody(), MessageGroup: "group-b"},
+	}
+
+	if err := consumer.processBatch(context.Background(), messages); err == nil {
+		t.Fatal("expected failed group to return an error")
+	}
+
+	inbox.mu.Lock()
+	processedIDs := append([]string(nil), inbox.processedIDs...)
+	inbox.mu.Unlock()
+	if containsString(processedIDs, "a2") {
+		t.Fatal("message after failed group-a message was processed")
+	}
+	if !containsString(processedIDs, "b1") || !containsString(processedIDs, "b2") {
+		t.Fatalf("expected group-b messages to continue, processed=%v", processedIDs)
+	}
+	if containsString(receiver.deleted, "ra1") || containsString(receiver.deleted, "ra2") {
+		t.Fatalf("expected group-a messages to remain undeleted, deleted=%v", receiver.deleted)
+	}
+}
+
+type groupFailureInbox struct {
+	mu              sync.Mutex
+	failedMessageID string
+	processedIDs    []string
+}
+
+func (r *groupFailureInbox) Process(ctx context.Context, _ string, messageID string, payload []byte, effect ports.InboxEffect) (bool, error) {
+	if messageID == r.failedMessageID {
+		return false, errors.New("group message failed")
+	}
+	if err := effect(ctx, payload); err != nil {
+		return false, err
+	}
+	r.mu.Lock()
+	r.processedIDs = append(r.processedIDs, messageID)
+	r.mu.Unlock()
+	return false, nil
+}
+
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
+}
+
 func TestQueueConsumerShutdownCancelsPolling(t *testing.T) {
 	receiver := &fakeQueueReceiver{}
 	inbox := &fakeInboxRepository{}

@@ -64,12 +64,7 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	queueManager := sqsInfra.NewQueueManager(sqsClient, cfg)
-
-	queueURLs, err := queueManager.Resolve(ctx)
-	if err != nil {
-		t.Skipf("LocalStack/SQS unavailable: %v", err)
-	}
+	transactionQueueURL := createRecoveryTestQueue(t, cfg)
 
 	message := messaging.WagerTransactionRequested{
 		Type: "WagerTransactionRequested",
@@ -97,14 +92,14 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 	messageID := sendRecoveryMessage(
 		t,
 		cfg,
-		queueURLs.Transaction,
+		transactionQueueURL,
 		string(messageBody),
 		walletID.String(),
 		"recovery-"+uuid.New().String(),
 	)
 
 	t.Cleanup(func() {
-		cleanupRecoveryMessage(t, queueURLs.Transaction, messageID)
+		cleanupRecoveryMessage(t, transactionQueueURL, messageID)
 
 		_, _ = pool.Exec(
 			ctx,
@@ -149,7 +144,7 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := sqsConsumer.ConfigureQueueURL(queueURLs.Transaction); err != nil {
+	if err := sqsConsumer.ConfigureQueueURL(transactionQueueURL); err != nil {
 		t.Fatal(err)
 	}
 
@@ -177,6 +172,14 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 	if err := firstConsumer.Start(firstCtx); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		firstCancel()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer stopCancel()
+		if err := firstConsumer.Stop(stopCtx); err != nil {
+			t.Logf("stop first consumer during cleanup: %v", err)
+		}
+	})
 
 	select {
 	case <-firstReceiver.deleteStarted:
@@ -293,7 +296,7 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := secondSQSConsumer.ConfigureQueueURL(queueURLs.Transaction); err != nil {
+	if err := secondSQSConsumer.ConfigureQueueURL(transactionQueueURL); err != nil {
 		t.Fatal(err)
 	}
 
@@ -323,10 +326,14 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	defer func() {
+	t.Cleanup(func() {
 		secondCancel()
-		_ = secondConsumer.Stop(context.Background())
-	}()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer stopCancel()
+		if err := secondConsumer.Stop(stopCtx); err != nil {
+			t.Logf("stop second consumer during cleanup: %v", err)
+		}
+	})
 
 	select {
 	case <-secondReceiver.messageReceived:
@@ -635,6 +642,50 @@ func recoverySQSConfig() config.Config {
 		TransactionDLQ:     "wager-transactions-dlq.fifo",
 		EventQueue:         "wager-events.fifo",
 	}
+}
+
+func createRecoveryTestQueue(t *testing.T, cfg config.Config) string {
+	t.Helper()
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(
+		context.Background(),
+		awsconfig.WithRegion(cfg.AWSRegion),
+		awsconfig.WithBaseEndpoint(cfg.AWSEndpoint),
+		awsconfig.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(
+				cfg.AWSAccessKeyID,
+				cfg.AWSSecretAccessKey,
+				"",
+			),
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := awsSQS.NewFromConfig(awsCfg)
+	queueName := "consumer-recovery-" + uuid.NewString() + ".fifo"
+	output, err := client.CreateQueue(context.Background(), &awsSQS.CreateQueueInput{
+		QueueName: &queueName,
+		Attributes: map[string]string{
+			"FifoQueue":                 "true",
+			"ContentBasedDeduplication": "false",
+		},
+	})
+	if err != nil || output.QueueUrl == nil {
+		t.Fatalf("create consumer recovery queue: %v", err)
+	}
+
+	queueURL := *output.QueueUrl
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := client.DeleteQueue(ctx, &awsSQS.DeleteQueueInput{QueueUrl: &queueURL}); err != nil {
+			t.Logf("delete consumer recovery queue: %v", err)
+		}
+	})
+
+	return queueURL
 }
 
 func sendRecoveryMessage(
