@@ -392,6 +392,15 @@ func (s *Server) getTransactionHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
+	identity, ok := auth.IdentityFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "provider_identity_required"})
+		return
+	}
+	if !identity.HasRole("wallet-internal") && identity.ProviderID != transaction.ProviderID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "provider_access_denied"})
+		return
+	}
 	writeJSON(w, http.StatusOK, transactionResponse(transaction))
 }
 

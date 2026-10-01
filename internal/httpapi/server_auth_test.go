@@ -17,7 +17,8 @@ import (
 )
 
 type authTestWageringRepo struct {
-	request ports.ProcessTransactionRequest
+	request     ports.ProcessTransactionRequest
+	transaction ports.TransactionView
 }
 
 func (r *authTestWageringRepo) ProcessTransaction(_ context.Context, request ports.ProcessTransactionRequest) (ports.ProcessTransactionResult, error) {
@@ -31,7 +32,7 @@ func (r *authTestWageringRepo) RetryPendingReference(context.Context, uuid.UUID)
 }
 
 func (r *authTestWageringRepo) GetTransaction(context.Context, uuid.UUID) (ports.TransactionView, error) {
-	return ports.TransactionView{}, nil
+	return r.transaction, nil
 }
 
 func (r *authTestWageringRepo) GetTransactionByExternal(context.Context, string, string) (ports.TransactionView, error) {
@@ -57,6 +58,7 @@ func TestWageringUsesAuthenticatedProviderInsteadOfBody(t *testing.T) {
 		wallets:  application.NewWalletService(authTestWalletRepo{}),
 		wagering: application.NewWageringService(repo),
 	}
+
 	playerID := uuid.New()
 	walletID := uuid.New()
 	body := `{"providerId":"provider-b","externalTransactionId":"external-1","playerId":"` + playerID.String() + `","walletId":"` + walletID.String() + `","roundId":"round","gameId":"game","kind":"BET","money":{"amount":"1.00","currency":"BRL"}}`
@@ -72,5 +74,43 @@ func TestWageringUsesAuthenticatedProviderInsteadOfBody(t *testing.T) {
 	}
 	if repo.request.ProviderID != "provider-a" {
 		t.Fatalf("expected authenticated provider provider-a, got %q", repo.request.ProviderID)
+	}
+}
+
+func TestGetTransactionRequiresMatchingProviderOrInternalRole(t *testing.T) {
+	transactionID := uuid.New()
+	repo := &authTestWageringRepo{transaction: ports.TransactionView{
+		ID: transactionID, ProviderID: "provider-a", Status: "PROCESSED",
+	}}
+	server := &Server{wagering: application.NewWageringService(repo)}
+
+	request := httptest.NewRequest(http.MethodGet, "/wagering/transactions/"+transactionID.String(), nil)
+	request.SetPathValue("transactionID", transactionID.String())
+	request = request.WithContext(auth.WithIdentity(request.Context(), auth.Identity{ProviderID: "provider-b"}))
+	response := httptest.NewRecorder()
+	server.getTransactionHandler(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("expected provider mismatch to be forbidden, got %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/wagering/transactions/"+transactionID.String(), nil)
+	request.SetPathValue("transactionID", transactionID.String())
+	request = request.WithContext(auth.WithIdentity(request.Context(), auth.Identity{ProviderID: "provider-a"}))
+	response = httptest.NewRecorder()
+	server.getTransactionHandler(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected matching provider to be allowed, got %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/wagering/transactions/"+transactionID.String(), nil)
+	request.SetPathValue("transactionID", transactionID.String())
+	request = request.WithContext(auth.WithIdentity(request.Context(), auth.Identity{
+		ProviderID: "internal-service",
+		Roles:      map[string]struct{}{"wallet-internal": {}},
+	}))
+	response = httptest.NewRecorder()
+	server.getTransactionHandler(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected internal role to be allowed, got %d", response.Code)
 	}
 }
