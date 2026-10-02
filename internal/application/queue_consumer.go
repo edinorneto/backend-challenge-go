@@ -206,6 +206,10 @@ func (c *QueueConsumer) processBatch(ctx context.Context, messages []ports.Queue
 }
 
 func (c *QueueConsumer) scheduleRetry(ctx context.Context, message ports.QueueMessage, cause error) {
+	kind := failureKind(cause)
+	if c.metrics != nil {
+		c.metrics.IncLabeled("sqs_message_failures_total", map[string]string{"kind": kind})
+	}
 	changer, ok := c.receiver.(ports.QueueVisibilityChanger)
 	if !ok {
 		return
@@ -238,7 +242,29 @@ func (c *QueueConsumer) scheduleRetry(ctx context.Context, message ports.QueueMe
 			"messageId": message.MessageID,
 			"attempt":   fmt.Sprint(message.ReceiveCount),
 			"duration":  delay.String(),
+			"result":    kind,
 		})
+	}
+}
+
+// errInvalidMessage marks a message that cannot be decoded or validated.
+var errInvalidMessage = errors.New("invalid message")
+
+// failureKind classifies a failed delivery for metrics and logs. Invalid input
+// and conflicts are permanent: redelivery cannot fix them, so the message ends
+// in the DLQ. Anything else is treated as an infrastructure failure.
+func failureKind(err error) string {
+	switch {
+	case errors.Is(err, errInvalidMessage),
+		errors.Is(err, ErrInvalidWagerRequest),
+		errors.Is(err, ErrIdempotencyKeyRequired),
+		errors.Is(err, ports.ErrWalletNotFound):
+		return "invalid_message"
+	case errors.Is(err, ports.ErrIdempotencyConflict),
+		errors.Is(err, ports.ErrExternalTransactionConflict):
+		return "conflict"
+	default:
+		return "infrastructure"
 	}
 }
 
@@ -274,10 +300,10 @@ func (c *QueueConsumer) processMessage(ctx context.Context, message ports.QueueM
 	}
 	var envelope messaging.EventEnvelope
 	if err := json.Unmarshal([]byte(message.Body), &envelope); err != nil {
-		return fmt.Errorf("decode message %s: %w", message.MessageID, err)
+		return fmt.Errorf("decode message %s: %w: %w", message.MessageID, errInvalidMessage, err)
 	}
 	if err := envelope.Validate(); err != nil {
-		return fmt.Errorf("validate message %s: invalid event envelope", message.MessageID)
+		return fmt.Errorf("validate message %s: %w: invalid event envelope", message.MessageID, errInvalidMessage)
 	}
 	_, err := c.inbox.Process(ctx, c.cfg.Name, message.MessageID, []byte(message.Body), c.effect)
 	if err != nil {
@@ -289,10 +315,10 @@ func (c *QueueConsumer) processMessage(ctx context.Context, message ports.QueueM
 func (c *QueueConsumer) processCommand(ctx context.Context, message ports.QueueMessage) error {
 	var command messaging.WagerTransactionRequested
 	if err := json.Unmarshal([]byte(message.Body), &command); err != nil {
-		return fmt.Errorf("decode transaction command %s: %w", message.MessageID, err)
+		return fmt.Errorf("decode transaction command %s: %w: %w", message.MessageID, errInvalidMessage, err)
 	}
 	if err := command.Validate(); err != nil {
-		return fmt.Errorf("validate transaction command %s: %w", message.MessageID, err)
+		return fmt.Errorf("validate transaction command %s: %w: %w", message.MessageID, errInvalidMessage, err)
 	}
 	// For SQS the envelope messageId is the correlation ID of every log line of
 	// this command, as the Correlation-ID header is for HTTP.
@@ -304,7 +330,7 @@ func (c *QueueConsumer) processCommand(ctx context.Context, message ports.QueueM
 	}
 	amount, err := money.ParseExternal(command.Data.Money.Amount, command.Data.Money.Currency)
 	if err != nil {
-		return fmt.Errorf("parse transaction command money: %w", err)
+		return fmt.Errorf("parse transaction command money: %w: %w", errInvalidMessage, err)
 	}
 	txCtx, tx, err := c.txManager.Begin(ctx)
 	if err != nil {
