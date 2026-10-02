@@ -1,2 +1,12 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts run inside Linux containers (LocalStack init): always LF,
+# also on Windows checkouts, or the shebang becomes "/bin/sh\r".
+*.sh text eol=lf
+
+# Go sources and module files: LF everywhere, so "gofmt -l ." and
+# "go mod tidy -diff" stay clean on Windows checkouts too.
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
