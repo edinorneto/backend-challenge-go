@@ -30,6 +30,7 @@ services:
       - "4566:4566"
     volumes:
       - "./localstack/init/ready.d:/etc/localstack/init/ready.d"
+      - "./localstack/policies:/etc/localstack/policies:ro"
     healthcheck:
       test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name \"$${SQS_TRANSACTION_QUEUE:-wager-transactions.fifo}\" >/dev/null 2>&1 && awslocal sqs get-queue-url --queue-name \"$${SQS_TRANSACTION_DLQ:-wager-transactions-dlq.fifo}\" >/dev/null 2>&1 && awslocal sqs get-queue-url --queue-name \"$${SQS_EVENT_QUEUE:-wager-events.fifo}\" >/dev/null 2>&1"]
       interval: 5s

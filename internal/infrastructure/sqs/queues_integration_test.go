@@ -5,6 +5,7 @@ package sqs
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -70,6 +71,70 @@ func TestLocalStackTransactionQueues(t *testing.T) {
 	}
 	if !strings.HasSuffix(redrive.DeadLetterTargetARN, cfg.TransactionDLQ) {
 		t.Fatalf("expected redrive DLQ ARN to end with %q, got %q", cfg.TransactionDLQ, redrive.DeadLetterTargetARN)
+	}
+
+	// Access policies (localstack/policies): who may send to and consume from each
+	// queue. LocalStack stores them without enforcing IAM.
+	for queueURL, expected := range map[string]map[string]string{
+		urls.Transaction: {
+			"role/wagering-provider-producer": "sqs:SendMessage",
+			"role/backend-application":        "sqs:ReceiveMessage",
+		},
+		urls.TransactionDLQ: {
+			"sqs.amazonaws.com":     "sqs:SendMessage",
+			"role/backend-operator": "sqs:StartMessageMoveTask",
+		},
+		urls.EventQueue: {
+			"role/backend-application":   "sqs:SendMessage",
+			"role/wager-events-consumer": "sqs:ReceiveMessage",
+		},
+	} {
+		assertQueuePolicy(t, client, queueURL, expected)
+	}
+}
+
+// assertQueuePolicy checks that each principal is allowed the given action and
+// that providers are never allowed to consume.
+func assertQueuePolicy(t *testing.T, client *Client, queueURL string, expected map[string]string) {
+	t.Helper()
+	attributes, err := client.GetQueueAttributes(context.Background(), queueURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policy struct {
+		Statement []struct {
+			Effect    string          `json:"Effect"`
+			Principal map[string]any  `json:"Principal"`
+			Action    json.RawMessage `json:"Action"`
+		} `json:"Statement"`
+	}
+	if err := json.Unmarshal([]byte(attributes["Policy"]), &policy); err != nil {
+		t.Fatalf("queue %s has no valid access policy: %v (%q)", queueURL, err, attributes["Policy"])
+	}
+	allowed := map[string]string{}
+	for _, statement := range policy.Statement {
+		if statement.Effect != "Allow" {
+			continue
+		}
+		for _, principal := range statement.Principal {
+			allowed[fmt.Sprint(principal)] += string(statement.Action)
+		}
+	}
+	for principal, action := range expected {
+		found := false
+		for name, actions := range allowed {
+			if strings.HasSuffix(name, principal) && strings.Contains(actions, action) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("queue %s policy does not allow %s for %s: %v", queueURL, action, principal, allowed)
+		}
+	}
+	for name, actions := range allowed {
+		if strings.HasSuffix(name, "role/wagering-provider-producer") && strings.Contains(actions, "ReceiveMessage") {
+			t.Fatalf("providers must not consume from %s", queueURL)
+		}
 	}
 }
 

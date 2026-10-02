@@ -1,0 +1,34 @@
+{
+  "Version": "2012-10-17",
+  "Id": "wager-transactions-dlq-access",
+  "Statement": [
+    {
+      "Sid": "OnlyRedriveFromTheCommandQueue",
+      "Effect": "Allow",
+      "Principal": { "Service": "sqs.amazonaws.com" },
+      "Action": "sqs:SendMessage",
+      "Resource": "__QUEUE_ARN__",
+      "Condition": { "ArnEquals": { "aws:SourceArn": "__SOURCE_QUEUE_ARN__" } }
+    },
+    {
+      "Sid": "ApplicationChecksReadiness",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::__ACCOUNT__:role/backend-application" },
+      "Action": ["sqs:GetQueueUrl", "sqs:GetQueueAttributes"],
+      "Resource": "__QUEUE_ARN__"
+    },
+    {
+      "Sid": "OperatorsInspectAndRedrive",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::__ACCOUNT__:role/backend-operator" },
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:StartMessageMoveTask",
+        "sqs:ListMessageMoveTasks"
+      ],
+      "Resource": "__QUEUE_ARN__"
+    }
+  ]
+}

@@ -1422,3 +1422,53 @@ func TestSchemaRejectsSecondOpeningForAWallet(t *testing.T) {
 		t.Fatalf("expected the second OPENING to violate uq_wager_opening_per_wallet, got %v", err)
 	}
 }
+
+// The ledger is append-only in the database: no entry can be edited or removed,
+// whatever the client.
+func TestLedgerEntriesCannotBeUpdatedOrDeleted(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	_, walletID := createTestWallet(t, repo, pool, "100.00")
+
+	for name, statement := range map[string]string{
+		"amount":        `UPDATE wallet_ledger_entries SET amount_cents = 1 WHERE wallet_id = $1`,
+		"balance after": `UPDATE wallet_ledger_entries SET balance_after_cents = 999999 WHERE wallet_id = $1`,
+		"direction":     `UPDATE wallet_ledger_entries SET direction = 'DEBIT' WHERE wallet_id = $1`,
+		"delete":        `DELETE FROM wallet_ledger_entries WHERE wallet_id = $1`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := pool.Exec(context.Background(), statement, walletID)
+			if err == nil || !strings.Contains(err.Error(), "wallet ledger is append-only") {
+				t.Fatalf("expected the ledger trigger to refuse the change, got %v", err)
+			}
+		})
+	}
+	var amount, after int64
+	if err := pool.QueryRow(context.Background(), `SELECT amount_cents, balance_after_cents FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID).Scan(&amount, &after); err != nil {
+		t.Fatal(err)
+	}
+	if amount != 10000 || after != 10000 {
+		t.Fatalf("ledger entry changed: amount=%d after=%d", amount, after)
+	}
+}
+
+// A wallet opened with zero balance has no OPENING, no ledger entry and no
+// financial events; a positive opening creates exactly one of each kind.
+func TestOpeningWithZeroBalanceCreatesNoFinancialRecords(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	_, walletID := createTestWallet(t, repo, pool, "0.00")
+
+	var openings, entries, events, version int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT (SELECT COUNT(*) FROM wager_transactions WHERE wallet_id = $1),
+		       (SELECT COUNT(*) FROM wallet_ledger_entries WHERE wallet_id = $1),
+		       (SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1),
+		       (SELECT version FROM wallets WHERE id = $1)
+	`, walletID).Scan(&openings, &entries, &events, &version); err != nil {
+		t.Fatal(err)
+	}
+	if openings != 0 || entries != 0 || events != 0 || version != 1 {
+		t.Fatalf("zero opening created records: openings=%d entries=%d events=%d version=%d", openings, entries, events, version)
+	}
+}

@@ -10,8 +10,8 @@ import (
 )
 
 var (
-	ErrInvalidWallet      = errors.New("invalid wallet")
-	ErrInsufficientFunds  = errors.New("insufficient funds")
+	ErrInvalidWallet     = errors.New("invalid wallet")
+	ErrInsufficientFunds = errors.New("insufficient funds")
 )
 
 type Wallet struct {
@@ -38,7 +38,7 @@ func New(
 		return nil, ErrInvalidWallet
 	}
 
-	if initialBalance.IsNegative() {
+	if !initialBalance.IsValid() || initialBalance.IsNegative() {
 		return nil, ErrInvalidWallet
 	}
 

@@ -1,0 +1,20 @@
+{
+  "Version": "2012-10-17",
+  "Id": "wager-events-access",
+  "Statement": [
+    {
+      "Sid": "OnlyTheApplicationPublishesEvents",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::__ACCOUNT__:role/backend-application" },
+      "Action": ["sqs:SendMessage", "sqs:GetQueueUrl", "sqs:GetQueueAttributes"],
+      "Resource": "__QUEUE_ARN__"
+    },
+    {
+      "Sid": "EventConsumersRead",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::__ACCOUNT__:role/wager-events-consumer" },
+      "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueUrl"],
+      "Resource": "__QUEUE_ARN__"
+    }
+  ]
+}

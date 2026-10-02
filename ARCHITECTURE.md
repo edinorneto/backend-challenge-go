@@ -76,7 +76,8 @@ that validate the transition. They are created by constructors that validate
 every field (`wallet.New`, `wagertransaction.NewExternal`, `NewOpening`,
 `ledger.NewDebit`/`NewCredit`) and rebuilt from the database by `Rehydrate`.
 Rehydration checks consistency but never applies a movement, a transition or an
-event. Business rejections are values, not panics: errors are sentinels (e.g.
+event. A zero-value `Money` (no currency) is not a valid value: every constructor and
+operation refuses it (`TestDomainRejectsUninitializedMoney`). Business rejections are values, not panics: errors are sentinels (e.g.
 `wallet.ErrInsufficientFunds`, `money.ErrCurrencyMismatch`,
 `wagertransaction.ErrTerminalTransaction`) checked with `errors.Is`. Every I/O
 method takes a `context.Context`.
@@ -464,15 +465,25 @@ replay, reverse or read another provider's operation, and refused requests have
 no financial effect (`TestKeycloakProviderIsolationHasNoCrossProviderEffects`).
 Health checks are public. `/metrics` is public in Compose (see section 13).
 
-**Messaging access.** The challenge asks for broker access controlled by
-credentials and broker policies. In AWS this means IAM: providers' producers may
-only `SendMessage` to `wager-transactions.fifo`; the application's role may
-receive and delete from it, and send to `wager-events.fifo`; nobody else
-consumes the events of other providers. The application authenticates to SQS
-with its own credentials. The consumer trusts the broker for the sender's
-identity, so `data.providerId` is taken from an authenticated channel, and it
-still applies every domain validation. LocalStack Community does not enforce IAM,
-so these policies are not exercised locally (section 16).
+**Messaging access.** Access to the queues is controlled by credentials and by
+queue policies kept in the repository (`localstack/policies/*.json`). The
+LocalStack init script applies them to the queues it creates:
+
+| Queue | Allowed |
+| --- | --- |
+| `wager-transactions.fifo` | `role/wagering-provider-producer`: only `SendMessage`. `role/backend-application`: receive, delete, change visibility |
+| `wager-transactions-dlq.fifo` | SQS itself, only for redrive from the command queue (`aws:SourceArn`). `role/backend-application`: read attributes (readiness). `role/backend-operator`: inspect, delete and move messages back (`StartMessageMoveTask`) |
+| `wager-events.fifo` | `role/backend-application`: only `SendMessage`. `role/wager-events-consumer`: receive and delete |
+
+Providers can therefore only produce commands, never read them or the events.
+Only the application publishes events. The application uses its own
+credentials (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`).
+`TestLocalStackTransactionQueues` checks that every queue has its policy and that
+providers are never allowed to consume. The consumer trusts the authenticated
+producer for `data.providerId` and still applies every domain validation (the
+wallet's player and currency, reference matching, idempotency). LocalStack
+Community stores the policies but does not enforce IAM, so the denial itself is
+not exercised locally (section 16).
 
 ## 11. Health, failures and multiple instances
 
@@ -646,9 +657,14 @@ apply again, and the data is kept and the later protections come back.
   recoverable situation into a terminal one. The state exists in the domain and
   the schema, and a reversal whose reference is `FAILED` is rejected as
   `reference_incompatible`.
-- **Broker policies.** IAM policies for the queues are described in section 10
-  but not applied: LocalStack Community does not enforce IAM. The consumer
-  trusts `data.providerId` as coming from an authenticated producer.
+- **Broker policies** are defined, versioned and applied to the queues (section
+  10), but LocalStack Community does not enforce IAM. A request from a principal
+  outside the policy is therefore not actually denied locally; on AWS it would be.
+  The consumer trusts `data.providerId` as coming from an authenticated producer.
+- **`WIN` reference.** A `WIN` may carry `referenceExternalTransactionId` (the
+  challenge makes it optional). It is stored and returned in reads and events,
+  but it is not resolved or validated against a bet; only `REFUND` and
+  `ROLLBACK` require and resolve a reference.
 - **Reading another provider's transaction answers `403`,** which reveals that
   the ID exists. The challenge does not require `404`.
 - **Currencies** are validated by format (three upper-case letters), not

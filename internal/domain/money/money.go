@@ -104,6 +104,12 @@ func (m Money) Currency() string {
 	return m.currency
 }
 
+// IsValid reports whether m was built by a constructor: the zero value of Money
+// has no currency and is not a valid amount.
+func (m Money) IsValid() bool {
+	return currencyPattern.MatchString(m.currency)
+}
+
 func (m Money) IsZero() bool {
 	return m.amountCents == 0
 }

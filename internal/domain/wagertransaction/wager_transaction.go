@@ -226,7 +226,7 @@ func NewOpening(
 		return nil, ErrInvalidTransaction
 	}
 
-	if amount.IsNegative() {
+	if !amount.IsValid() || amount.IsNegative() {
 		return nil, ErrInvalidTransaction
 	}
 

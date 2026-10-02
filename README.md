@@ -214,6 +214,11 @@ persist through every attempt go to the DLQ after `SQS_MAX_RECEIVE_COUNT`
 receives (visibility timeout 30 s, retries 1 to 30 s apart). Results are
 published as events on `wager-events.fifo` (contract in `ARCHITECTURE.md`).
 
+Each queue has an access policy, versioned in `localstack/policies/` and applied
+by the init script. Providers may only send commands; only the application
+consumes commands and publishes events (see `ARCHITECTURE.md`, section 10).
+LocalStack Community stores these policies but does not enforce IAM.
+
 ## Migrations
 
 Migrations are versioned SQL files embedded in the binaries
@@ -267,7 +272,7 @@ and `2` on invalid usage.
 | --- | --- | --- |
 | `go vet ./...` | nothing | static checks |
 | `go test ./...` | nothing | unit tests. Tests that need PostgreSQL, SQS or Keycloak **skip** when they are not reachable, so a green run here does not prove the integration |
-| `go test -tags=integration -count=1 ./...` | the Compose stack | unit and integration tests against the real PostgreSQL, LocalStack and Keycloak (about 235 tests) |
+| `go test -tags=integration -count=1 ./...` | the Compose stack | unit and integration tests against the real PostgreSQL, LocalStack and Keycloak (about 245 tests) |
 | `go test -race -tags=integration -count=1 ./...` | the stack, cgo | the same with the race detector |
 | `go test -tags=e2e -count=1 -v ./test/e2e/` | the stack and the `docker` CLI | end-to-end scenarios through Nginx and the three replicas |
 
