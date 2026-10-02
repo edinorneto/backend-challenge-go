@@ -172,3 +172,151 @@ func TestEmbeddedMigrationsAreContiguousAndReversible(t *testing.T) {
 		}
 	}
 }
+
+// Reverting to the initial schema and applying again must keep existing data and
+// restore every protection added by the later migrations.
+func TestRunnerRoundTripPreservesDataAndRestoresProtections(t *testing.T) {
+	pool := isolatedMigrationPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	runner := &Runner{pool: pool}
+	latest, err := latestMigrationVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Up(ctx); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+
+	walletID := uuid.New()
+	transactionID := uuid.New()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO wallets (id, player_id, currency, balance_cents, version, created_at, updated_at)
+		VALUES ($1, $2, 'BRL', 10000, 1, NOW(), NOW())
+	`, walletID, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO wager_transactions (id, source, player_id, wallet_id, kind, status, amount_cents, currency,
+			result_balance_cents, result_wallet_version, reference_attempts, created_at, updated_at, processed_at)
+		SELECT $1, 'INTERNAL', player_id, id, 'OPENING', 'PROCESSED', 10000, 'BRL', 10000, 1, 0, NOW(), NOW(), NOW()
+		FROM wallets WHERE id = $2
+	`, transactionID, walletID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount_cents, currency,
+			balance_before_cents, balance_after_cents, created_at)
+		VALUES ($1, $2, $3, 'CREDIT', 10000, 'BRL', 0, 10000, NOW())
+	`, uuid.New(), walletID, transactionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, correlation_id,
+			occurred_at, version, payload)
+		VALUES ($1, 'wallet', $2, 'WalletBalanceChanged', $3, NOW(), 1, '{"walletId":"x"}')
+	`, uuid.New(), walletID, transactionID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runner.Down(ctx, int(latest-1)); err != nil {
+		t.Fatalf("down to the initial migration: %v", err)
+	}
+	assertMigrationCount(t, pool, 1)
+	assertExists(t, pool, `SELECT to_regclass('uq_wager_processed_reversal_reference_kind') IS NOT NULL`, false, "reversal uniqueness index")
+	assertExists(t, pool, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'outbox_events' AND column_name = 'last_error')`, false, "outbox last_error column")
+	assertExists(t, pool, `SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_prevent_outbox_snapshot_update' AND tgrelid = to_regclass('outbox_events'))`, false, "outbox snapshot trigger")
+	assertDataIntact(t, pool, walletID)
+
+	if err := runner.Up(ctx); err != nil {
+		t.Fatalf("re-apply after revert: %v", err)
+	}
+	assertMigrationCount(t, pool, int(latest))
+	assertExists(t, pool, `SELECT to_regclass('uq_wager_processed_reversal_reference_kind') IS NOT NULL`, true, "reversal uniqueness index")
+	assertExists(t, pool, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'outbox_events' AND column_name = 'last_error')`, true, "outbox last_error column")
+	assertDataIntact(t, pool, walletID)
+
+	if _, err := pool.Exec(ctx, `UPDATE outbox_events SET payload = '{}' WHERE aggregate_id = $1`, walletID); err == nil {
+		t.Fatal("re-applied migrations must protect the outbox snapshot again")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID); err == nil {
+		t.Fatal("the ledger must stay append-only after the round trip")
+	}
+
+	if err := runner.Down(ctx, 100); err != nil {
+		t.Fatalf("reverting more steps than applied must revert everything: %v", err)
+	}
+	assertMigrationCount(t, pool, 0)
+}
+
+func isolatedMigrationPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = "postgres://postgres:postgres@localhost:5432/betting?sslmode=disable"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	basePool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Skipf("PostgreSQL unavailable: %v", err)
+	}
+	t.Cleanup(basePool.Close)
+	if err := basePool.Ping(ctx); err != nil {
+		t.Skipf("PostgreSQL unavailable: %v", err)
+	}
+	schema := "migration_roundtrip_" + uuid.New().String()[:8]
+	if _, err := basePool.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = basePool.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`) })
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolConfig.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+func assertMigrationCount(t *testing.T, pool *pgxpool.Pool, expected int) {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != expected {
+		t.Fatalf("expected %d applied migrations, got %d", expected, count)
+	}
+}
+
+func assertExists(t *testing.T, pool *pgxpool.Pool, query string, expected bool, object string) {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(), query).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists != expected {
+		t.Fatalf("expected %s present=%v, got %v", object, expected, exists)
+	}
+}
+
+func assertDataIntact(t *testing.T, pool *pgxpool.Pool, walletID uuid.UUID) {
+	t.Helper()
+	var balance, ledger, events int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT w.balance_cents,
+		       (SELECT COUNT(*) FROM wallet_ledger_entries WHERE wallet_id = w.id),
+		       (SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = w.id)
+		FROM wallets w WHERE w.id = $1
+	`, walletID).Scan(&balance, &ledger, &events); err != nil {
+		t.Fatal(err)
+	}
+	if balance != 10000 || ledger != 1 || events != 1 {
+		t.Fatalf("migration round trip changed data: balance=%d ledger=%d events=%d", balance, ledger, events)
+	}
+}

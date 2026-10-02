@@ -285,6 +285,17 @@ not metric labels, so series cardinality remains bounded.
 
 Database changes are versioned in embedded `up` and `down` SQL files. Startup runs
 pending migrations under a PostgreSQL advisory lock, up to the highest version
-among the embedded files. A missing version in the sequence stops startup. The standalone `cmd/migrate`
+among the embedded files. A missing version in the sequence stops startup.
+Each version, together with its `schema_migrations` row, runs in its own
+transaction; PostgreSQL DDL is transactional, so a failing migration leaves no
+partial schema. Tests cover concurrent `up` from two runners, revert of the
+latest versions, and a full round trip (revert to `000001`, then apply again)
+with existing data: the data is kept and the later protections (reversal
+uniqueness, outbox immutability) come back. The `cmd/migrate` command is tested
+against an isolated schema.
+
+Limitation: a binary does not reject a database that already has versions newer
+than the ones it embeds; it applies nothing and starts. Rolling back the
+application code therefore requires reverting its newer migrations first. The standalone `cmd/migrate`
 command can explicitly apply or revert versions, using the same lock and reversing
 versions in order.

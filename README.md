@@ -63,13 +63,52 @@ docker compose down
 
 ## Migrations
 
-Migrations are versioned and applied on application startup. They can also be
-managed explicitly with the migration command:
+Migrations are versioned SQL files embedded in the binaries
+(`internal/infrastructure/database/migrations/sql`, one `up` and one `down` per
+version):
+
+| Version | Change |
+| --- | --- |
+| `000001_init` | Wallets, wager transactions, append-only ledger (triggers), Inbox and Outbox |
+| `000002_reversal_uniqueness` | At most one processed `REFUND`/`ROLLBACK` per reference and kind |
+| `000003_outbox_last_error` | `outbox_events.last_error` |
+| `000004_outbox_immutable_snapshot` | Trigger that keeps the outbox event snapshot immutable |
+
+**Apply.** Every application instance applies the pending versions on startup,
+under a PostgreSQL advisory lock, so concurrent instances apply each version once.
+They can also be applied explicitly. Each version runs in its own transaction,
+and `up` is a no-op when everything is already applied.
+
+**Revert.** `down -steps N` reverts the latest N applied versions, newest first,
+each in its own transaction and under the same lock. Stop the application before
+reverting: running instances expect the latest schema, and a restarted instance
+applies the reverted versions again. Reverting `000001_init` drops every
+financial table and its data. That cannot be undone, and `schema_migrations` is
+left empty, not dropped.
+
+With the Compose stack (no local Go needed; the image ships `/app/migrate`):
+
+```powershell
+docker compose up -d postgres
+docker compose stop application
+docker compose run --rm --no-deps --entrypoint /app/migrate application -direction down -steps 1
+docker compose run --rm --no-deps --entrypoint /app/migrate application -direction up
+docker compose up -d --scale application=3
+```
+
+In Git Bash on Windows, prefix those commands with `MSYS_NO_PATHCONV=1` so
+`/app/migrate` is not rewritten as a Windows path.
+
+With a local Go toolchain, using `DATABASE_URL` (default
+`postgres://postgres:postgres@localhost:5432/betting?sslmode=disable`):
 
 ```powershell
 go run ./cmd/migrate -direction up
 go run ./cmd/migrate -direction down -steps 1
 ```
+
+The command exits with `0` on success, `1` on a database or migration failure,
+and `2` on invalid usage (unknown direction or `-steps` below 1).
 
 For the multi-instance checks, keep one PostgreSQL/LocalStack/Keycloak stack and
 scale only the API workers behind Nginx:
@@ -88,11 +127,6 @@ go vet ./...
 
 Integration tests use the real PostgreSQL, Keycloak and LocalStack services when
 run with `-tags=integration`.
-
-`down` reverts the latest applied versions in reverse order while holding the
-same PostgreSQL advisory lock used by startup migrations. Reverting the initial
-migration removes the migration table and the financial schema; starting the API
-again will apply the migrations again.
 
 ## Observability
 
