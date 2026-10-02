@@ -32,6 +32,9 @@ func (e EventEnvelope) Validate() error {
 		e.CorrelationID == uuid.Nil || e.Version < 1 || e.OccurredAt.IsZero() {
 		return ErrInvalidEventEnvelope
 	}
+	if version, ok := EventVersion(e.EventType); !ok || version != e.Version {
+		return ErrInvalidEventEnvelope
+	}
 	if _, offset := e.OccurredAt.Zone(); offset != 0 {
 		return ErrInvalidEventEnvelope
 	}

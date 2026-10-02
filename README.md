@@ -124,6 +124,9 @@ The worker claims a small pending batch with PostgreSQL lock-skipping semantics,
 uses the `aggregate_id` as the FIFO `MessageGroupId`, and reuses the stable
 `event_id` as `MessageDeduplicationId` so retries remain idempotent at the
 message layer. On failures, it schedules a retry with exponential backoff.
+The envelope, each event's payload, the aggregate/`MessageGroupId` routing and
+the consumption rules are documented in `ARCHITECTURE.md`
+("Integration event contract").
 
 The `wager-transactions.fifo` queue is the input command queue. Its messages
 have type `WagerTransactionRequested` and are processed by the same financial

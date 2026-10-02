@@ -258,7 +258,7 @@ func TestOutboxRepositoryClaimsConcurrentEventsOnce(t *testing.T) {
 		_, _ = pool.Exec(ctx, `DELETE FROM wallets WHERE id = $1`, walletID)
 	})
 
-	result, err := walletRepo.ProcessTransaction(ctx, ports.ProcessTransactionRequest{
+	_, err = walletRepo.ProcessTransaction(ctx, ports.ProcessTransactionRequest{
 		ProviderID:            "provider-claim-" + walletID.String(),
 		ExternalTransactionID: "claim-" + uuid.New().String(),
 		IdempotencyKey:        "claim-idem-" + uuid.New().String(),
@@ -278,8 +278,8 @@ func TestOutboxRepositoryClaimsConcurrentEventsOnce(t *testing.T) {
 		SELECT event_id
 		FROM outbox_events
 		WHERE aggregate_id = $1
-		   OR correlation_id = $2
-	`, walletID, result.TransactionID)
+		   OR correlation_id IN (SELECT id FROM wager_transactions WHERE wallet_id = $1)
+	`, walletID)
 	if err != nil {
 		t.Fatal(err)
 	}

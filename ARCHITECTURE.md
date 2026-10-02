@@ -84,6 +84,56 @@ concrete event, and `occurredAt` represents when the event occurred rather than
 when it was delivered to SQS. The `data` field contains the immutable snapshot
 persisted by the outbox.
 
+### Integration event contract
+
+Each event has a concrete Go payload type in `internal/messaging/events.go`. Only
+the event constructors (`NewWagerTransactionProcessed`, `NewWagerTransactionRejected`,
+`NewWalletBalanceChanged`, `NewWagerTransactionPendingReference`) define
+`eventType`, `version` and the aggregate. The payload is a sealed interface, so an
+event cannot carry arbitrary data. Before sending, the publisher validates the
+envelope: the event type must be known and its version must match the
+registered contract, IDs must be present, `occurredAt` must be UTC and `data`
+must be a non-null JSON object.
+
+Envelope fields:
+
+| Field | Meaning |
+| --- | --- |
+| `eventId` | UUID generated when the outbox row is written; reused on every republication and sent as `MessageDeduplicationId`. |
+| `eventType` / `version` | Set by the constructor. All events are currently at version `1`. |
+| `aggregateId` | `WalletBalanceChanged`: the wallet ID. The three `WagerTransaction*` events: the internal transaction ID, including `OPENING`. Also the FIFO `MessageGroupId`. |
+| `correlationId` | The internal transaction ID. All events from the same operation share it, whether it arrived via HTTP or SQS and whether it finished synchronously or in the reference worker. The HTTP `Correlation-ID` and the SQS `messageId` are request/transport identifiers. They appear in the logs together with `transactionId`, which links them to the events. |
+| `causationId` | Optional and currently omitted: no event is caused by another integration event. |
+| `occurredAt` | UTC RFC 3339 timestamp of the commit that produced the event. |
+
+Payloads (`data`). All money values are `{"amount":"25.00","currency":"BRL"}`
+with decimal strings, never JSON numbers.
+
+| Event | Trigger | Fields |
+| --- | --- | --- |
+| `WagerTransactionProcessed` | Successful operation, including `LOSS` and the internal `OPENING` | `transactionId`, `walletId`, `playerId`, `kind`, `status`, `money`, `result.balance`, `result.version`; for external operations also `providerId`, `externalTransactionId`, `roundId`, `gameId` and, for reversals, `referenceExternalTransactionId` |
+| `WagerTransactionRejected` | Definitive business rejection, including reference expiry | same identification fields as above, plus `failureCode`; for reference rejections also `referenceAttempts` and `nextAttemptAt` |
+| `WalletBalanceChanged` | Effective balance change (never for `LOSS` or rejections) | `walletId`, `transactionId`, `direction` (`DEBIT`/`CREDIT`), `money`, `balanceBefore`, `balanceAfter`, `walletVersion`, `previousVersion` |
+| `WagerTransactionPendingReference` | Reversal waiting for its reference (on registration and after each failed retry) | `transactionId`, `walletId`, `providerId`, `kind`, `status`, `failureCode`, `referenceExternalTransactionId`, `referenceAttempts`, `nextAttemptAt` |
+
+`OPENING` is internal: its `WagerTransactionProcessed` omits the external fields
+(`providerId`, `externalTransactionId`, `roundId`, `gameId`) instead of sending
+them empty.
+
+Routing and consumption: every event goes to the `wager-events.fifo` queue,
+which is separate from the command queue. Consumers should route by `eventType`,
+deduplicate by `eventId` (delivery is at-least-once, and SQS deduplication only
+covers a 5-minute window), and rely on order only within one `aggregateId`.
+For example, a wallet's `WalletBalanceChanged` events arrive in `walletVersion`
+order, but there is no ordering guarantee between a transaction's
+`WagerTransactionProcessed` and the matching `WalletBalanceChanged`.
+
+Snapshot immutability is enforced by the database. Migration `000004` adds a
+trigger that rejects any `UPDATE` to `event_id`, aggregate, `event_type`,
+`correlation_id`, `causation_id`, `occurred_at`, `version`, `payload` or
+`created_at`. Only the delivery state (`status`, `attempts`, `next_attempt_at`,
+lease, `published_at` and `last_error`) can change.
+
 The command SQS FIFO queue receives `WagerTransactionRequested` messages. The
 consumer long-polls the queue, groups messages by `MessageGroupId`, records
 `consumer_name + message_id + payload_hash` in PostgreSQL, invokes the same
@@ -169,6 +219,7 @@ not metric labels, so series cardinality remains bounded.
 ## Database migrations
 
 Database changes are versioned in embedded `up` and `down` SQL files. Startup runs
-pending migrations under a PostgreSQL advisory lock. The standalone `cmd/migrate`
+pending migrations under a PostgreSQL advisory lock, up to the highest version
+among the embedded files. A missing version in the sequence stops startup. The standalone `cmd/migrate`
 command can explicitly apply or revert versions, using the same lock and reversing
 versions in order.

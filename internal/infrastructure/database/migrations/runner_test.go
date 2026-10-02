@@ -70,11 +70,11 @@ func TestRunnerConcurrentUpIsSerialized(t *testing.T) {
 	}
 
 	var migrationCount int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3)`).Scan(&migrationCount); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version IN (1, 2, 3, 4)`).Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if migrationCount != 3 {
-		t.Fatalf("expected three applied migrations, got %d", migrationCount)
+	if migrationCount != 4 {
+		t.Fatalf("expected four applied migrations, got %d", migrationCount)
 	}
 }
 
@@ -123,11 +123,21 @@ func TestRunnerDownRevertsLatestMigrations(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 {
-		t.Fatalf("expected two migrations after one revert, got %d", count)
+	if count != 3 {
+		t.Fatalf("expected three migrations after one revert, got %d", count)
+	}
+	var outboxTriggers int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM pg_trigger
+		WHERE tgname = 'trg_prevent_outbox_snapshot_update' AND tgrelid = to_regclass('outbox_events')
+	`).Scan(&outboxTriggers); err != nil {
+		t.Fatal(err)
+	}
+	if outboxTriggers != 0 {
+		t.Fatal("expected outbox snapshot trigger to be dropped by its revert")
 	}
 
-	if err := runner.Down(ctx, 2); err != nil {
+	if err := runner.Down(ctx, 3); err != nil {
 		t.Fatalf("down remaining: %v", err)
 	}
 	var remaining int
@@ -143,5 +153,22 @@ func TestRunnerDownRevertsLatestMigrations(t *testing.T) {
 	}
 	if walletsTable != nil {
 		t.Fatal("expected initial migration revert to drop application tables")
+	}
+}
+
+func TestEmbeddedMigrationsAreContiguousAndReversible(t *testing.T) {
+	latest, err := latestMigrationVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest < 4 {
+		t.Fatalf("expected at least four embedded migrations, got %d", latest)
+	}
+	for version := int64(1); version <= latest; version++ {
+		for _, direction := range []string{"up", "down"} {
+			if _, err := findMigrationFile(version, direction); err != nil {
+				t.Fatalf("migration %d is missing its %s file: %v", version, direction, err)
+			}
+		}
 	}
 }

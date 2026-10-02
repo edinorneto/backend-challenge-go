@@ -4,6 +4,8 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -63,7 +65,12 @@ func (r *Runner) Up(ctx context.Context) error {
 		return fmt.Errorf("create schema_migrations table: %w", err)
 	}
 
-	for version := int64(1); version <= 3; version++ {
+	latest, err := latestMigrationVersion()
+	if err != nil {
+		return err
+	}
+
+	for version := int64(1); version <= latest; version++ {
 		var applied bool
 		err = conn.QueryRow(
 			migrationCtx,
@@ -189,6 +196,38 @@ func (r *Runner) Down(ctx context.Context, steps int) error {
 	}
 
 	return nil
+}
+
+// latestMigrationVersion returns the highest version among the embedded up
+// migrations. Up applies every version up to it, so a gap is reported as a
+// missing file instead of being skipped.
+func latestMigrationVersion() (int64, error) {
+	entries, err := migrationFS.ReadDir("sql")
+	if err != nil {
+		return 0, fmt.Errorf("list migration files: %w", err)
+	}
+	var latest int64
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".up.sql") {
+			continue
+		}
+		prefix, _, found := strings.Cut(name, "_")
+		if !found {
+			return 0, fmt.Errorf("migration file %s has no version prefix", name)
+		}
+		version, err := strconv.ParseInt(prefix, 10, 64)
+		if err != nil || version < 1 {
+			return 0, fmt.Errorf("migration file %s has an invalid version prefix", name)
+		}
+		if version > latest {
+			latest = version
+		}
+	}
+	if latest == 0 {
+		return 0, fmt.Errorf("no up migrations found")
+	}
+	return latest, nil
 }
 
 func findMigrationFile(version int64, direction string) (string, error) {
