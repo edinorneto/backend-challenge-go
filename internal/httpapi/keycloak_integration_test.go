@@ -78,7 +78,7 @@ func TestKeycloakProviderIsolationAndInternalHTTPAccess(t *testing.T) {
 
 	externalID := "keycloak-http-" + uuid.NewString()
 	idempotencyKey := "keycloak-idem-" + uuid.NewString()
-	body := fmt.Sprintf(`{"providerId":"provider-b","externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"round","gameId":"game","kind":"BET","money":{"amount":"1.00","currency":"BRL"}}`, externalID, playerID, walletID)
+	body := fmt.Sprintf(`{"providerId":"provider-a","externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"round","gameId":"game","kind":"BET","money":{"amount":"1.00","currency":"BRL"}}`, externalID, playerID, walletID)
 	response := doHTTP(t, httpServer.Client(), httpServer.URL+"/wagering/transactions", providerAToken, "POST", idempotencyKey, body)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("provider-a operation failed: %d %s", response.StatusCode, response.Body)
@@ -174,6 +174,190 @@ func TestKeycloakProviderIsolationAndInternalHTTPAccess(t *testing.T) {
 	internalRead := doHTTP(t, httpServer.Client(), httpServer.URL+"/wagering/transactions/"+operation.TransactionID.String(), internalToken, "GET", "", "")
 	if internalRead.StatusCode != http.StatusOK {
 		t.Fatalf("expected internal token to read transaction: %d %s", internalRead.StatusCode, internalRead.Body)
+	}
+}
+
+type keycloakHarness struct {
+	server    *httptest.Server
+	pool      *pgxpool.Pool
+	providerA string
+	providerB string
+	internal  string
+	walletID  uuid.UUID
+	playerID  uuid.UUID
+}
+
+func newKeycloakHarness(t *testing.T) keycloakHarness {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	cfg := config.Config{
+		OIDCIssuerURL:     envOrHTTP("OIDC_ISSUER_URL", "http://localhost:8081/realms/backend"),
+		OIDCJWKSURL:       envOrHTTP("OIDC_JWKS_URL", "http://localhost:8081/realms/backend/protocol/openid-connect/certs"),
+		OIDCAudience:      envOrHTTP("OIDC_AUDIENCE", "backend-api"),
+		OIDCProviderClaim: envOrHTTP("OIDC_PROVIDER_CLAIM", "provider_id"),
+	}
+	h := keycloakHarness{
+		providerA: keycloakToken(t, ctx, "password", "provider-a", "provider-a", "", cfg),
+		providerB: keycloakToken(t, ctx, "password", "provider-b", "provider-b", "", cfg),
+		internal:  keycloakToken(t, ctx, "client_credentials", "", "", envOrHTTP("BACKEND_INTERNAL_SECRET", "backend-internal-secret"), cfg),
+	}
+	pool, cleanupPool := integrationHTTPPool(t, ctx)
+	t.Cleanup(cleanupPool)
+	h.pool = pool
+	walletRepo := database.NewWalletRepo(pool)
+	verifier, err := auth.NewVerifier(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(application.NewWalletService(walletRepo), application.NewWageringService(walletRepo), auth.NewMiddleware(verifier), pool, nil)
+	h.server = httptest.NewServer(server.Handler())
+	t.Cleanup(h.server.Close)
+	h.playerID = uuid.New()
+	h.walletID = createIntegrationWallet(t, h.server.Client(), h.server.URL, h.internal, h.playerID)
+	t.Cleanup(func() { cleanupIntegrationWallet(t, pool, h.walletID) })
+	return h
+}
+
+func (h keycloakHarness) do(t *testing.T, method, path, token, idempotencyKey, body string) httpResponse {
+	t.Helper()
+	return doHTTP(t, h.server.Client(), h.server.URL+path, token, method, idempotencyKey, body)
+}
+
+func (h keycloakHarness) wager(t *testing.T, token, idempotencyKey, providerField, externalID, kind, amount, reference string) httpResponse {
+	t.Helper()
+	body := fmt.Sprintf(`{%s"externalTransactionId":"%s","playerId":"%s","walletId":"%s","roundId":"round","gameId":"game","kind":"%s","money":{"amount":"%s","currency":"BRL"}%s}`,
+		providerField, externalID, h.playerID, h.walletID, kind, amount, reference)
+	return h.do(t, http.MethodPost, "/wagering/transactions", token, idempotencyKey, body)
+}
+
+// assertFinancialState checks the stored balance and the ledger directly in PostgreSQL.
+func (h keycloakHarness) assertFinancialState(t *testing.T, wantBalance string, wantLedgerEntries int) {
+	t.Helper()
+	response := h.do(t, http.MethodGet, "/wallets/"+h.walletID.String(), h.internal, "", "")
+	var wallet struct {
+		Balance struct {
+			Amount string `json:"amount"`
+		} `json:"balance"`
+	}
+	decodeHTTP(t, response, &wallet)
+	if wallet.Balance.Amount != wantBalance {
+		t.Fatalf("expected balance %s, got %s", wantBalance, wallet.Balance.Amount)
+	}
+	var entries int
+	if err := h.pool.QueryRow(context.Background(), `SELECT count(*) FROM wallet_ledger_entries WHERE wallet_id = $1`, h.walletID).Scan(&entries); err != nil {
+		t.Fatal(err)
+	}
+	if entries != wantLedgerEntries {
+		t.Fatalf("expected %d ledger entries, got %d", wantLedgerEntries, entries)
+	}
+}
+
+func (h keycloakHarness) transactionCount(t *testing.T, providerID, externalID string) int {
+	t.Helper()
+	var count int
+	if err := h.pool.QueryRow(context.Background(), `SELECT count(*) FROM wager_transactions WHERE wallet_id = $1 AND provider_id = $2 AND external_transaction_id = $3`, h.walletID, providerID, externalID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func TestKeycloakProviderIsolationHasNoCrossProviderEffects(t *testing.T) {
+	h := newKeycloakHarness(t)
+	h.assertFinancialState(t, "100.00", 1)
+
+	// 1. provider-a cannot act as provider-b through the body.
+	spoofID := "spoof-" + uuid.NewString()
+	spoof := h.wager(t, h.providerA, "spoof-key-"+uuid.NewString(), `"providerId":"provider-b",`, spoofID, "BET", "10.00", "")
+	if spoof.StatusCode != http.StatusForbidden || !strings.Contains(spoof.Body, "provider_mismatch") {
+		t.Fatalf("expected 403 provider_mismatch, got %d %s", spoof.StatusCode, spoof.Body)
+	}
+	if h.transactionCount(t, "provider-a", spoofID)+h.transactionCount(t, "provider-b", spoofID) != 0 {
+		t.Fatal("mismatched provider request persisted a transaction")
+	}
+	h.assertFinancialState(t, "100.00", 1)
+
+	// 2. The internal service is not a provider and cannot submit wagering operations.
+	internalOp := h.wager(t, h.internal, "internal-key-"+uuid.NewString(), "", "internal-"+uuid.NewString(), "BET", "10.00", "")
+	if internalOp.StatusCode != http.StatusForbidden {
+		t.Fatalf("internal service should not submit wagering operations: %d %s", internalOp.StatusCode, internalOp.Body)
+	}
+	// Providers cannot use wallet operations.
+	for _, path := range []string{"/wallets/" + h.walletID.String(), "/wallets/" + h.walletID.String() + "/ledger"} {
+		if response := h.do(t, http.MethodGet, path, h.providerA, "", ""); response.StatusCode != http.StatusForbidden {
+			t.Fatalf("provider should not access %s: %d", path, response.StatusCode)
+		}
+	}
+	if response := h.do(t, http.MethodPost, "/wallets/"+h.walletID.String()+"/reconciliation", h.providerA, "", ""); response.StatusCode != http.StatusForbidden {
+		t.Fatalf("provider should not reconcile wallets: %d", response.StatusCode)
+	}
+	h.assertFinancialState(t, "100.00", 1)
+
+	// 3. provider-a processes an operation.
+	sharedKey := "shared-key-" + uuid.NewString()
+	sharedExternalID := "shared-" + uuid.NewString()
+	first := h.wager(t, h.providerA, sharedKey, "", sharedExternalID, "BET", "10.00", "")
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("provider-a BET failed: %d %s", first.StatusCode, first.Body)
+	}
+	var aResult struct {
+		TransactionID    uuid.UUID `json:"transactionId"`
+		IdempotentReplay bool      `json:"idempotentReplay"`
+	}
+	decodeHTTP(t, first, &aResult)
+	h.assertFinancialState(t, "90.00", 2)
+
+	// 4. provider-b reusing provider-a's Idempotency-Key and external ID never sees
+	//    provider-a's result: idempotency is scoped by provider.
+	crossReplay := h.wager(t, h.providerB, sharedKey, "", sharedExternalID, "BET", "10.00", "")
+	var bResult struct {
+		TransactionID    uuid.UUID `json:"transactionId"`
+		IdempotentReplay bool      `json:"idempotentReplay"`
+	}
+	decodeHTTP(t, crossReplay, &bResult)
+	if bResult.TransactionID == aResult.TransactionID || bResult.IdempotentReplay {
+		t.Fatalf("idempotency crossed providers: a=%s b=%+v body=%s", aResult.TransactionID, bResult, crossReplay.Body)
+	}
+	if strings.Contains(crossReplay.Body, aResult.TransactionID.String()) {
+		t.Fatal("provider-b response exposed provider-a transaction ID")
+	}
+	h.assertFinancialState(t, "80.00", 3)
+	// provider-b replay of its own operation returns its own result.
+	bReplay := h.wager(t, h.providerB, sharedKey, "", sharedExternalID, "BET", "10.00", "")
+	if !strings.Contains(bReplay.Body, `"idempotentReplay":true`) || !strings.Contains(bReplay.Body, bResult.TransactionID.String()) {
+		t.Fatalf("provider-b replay did not return its own result: %s", bReplay.Body)
+	}
+	h.assertFinancialState(t, "80.00", 3)
+
+	// 5. Reads are isolated: by internal ID and by (providerId, externalTransactionId).
+	if response := h.do(t, http.MethodGet, "/wagering/transactions/"+aResult.TransactionID.String(), h.providerB, "", ""); response.StatusCode != http.StatusForbidden || strings.Contains(response.Body, sharedExternalID) {
+		t.Fatalf("provider-b read provider-a transaction: %d %s", response.StatusCode, response.Body)
+	}
+	if response := h.do(t, http.MethodGet, "/providers/provider-a/wagering/transactions/"+sharedExternalID, h.providerB, "", ""); response.StatusCode != http.StatusForbidden {
+		t.Fatalf("provider-b read provider-a external transaction: %d %s", response.StatusCode, response.Body)
+	}
+	ownB := h.do(t, http.MethodGet, "/providers/provider-b/wagering/transactions/"+sharedExternalID, h.providerB, "", "")
+	if ownB.StatusCode != http.StatusOK || !strings.Contains(ownB.Body, bResult.TransactionID.String()) || strings.Contains(ownB.Body, aResult.TransactionID.String()) {
+		t.Fatalf("provider-b external lookup did not resolve to its own transaction: %d %s", ownB.StatusCode, ownB.Body)
+	}
+
+	// 6. References never cross providers: provider-b cannot refund provider-a's bet.
+	aOnlyBetID := "a-only-bet-" + uuid.NewString()
+	if response := h.wager(t, h.providerA, "a-only-key-"+uuid.NewString(), "", aOnlyBetID, "BET", "5.00", ""); response.StatusCode != http.StatusOK {
+		t.Fatalf("provider-a BET failed: %d %s", response.StatusCode, response.Body)
+	}
+	h.assertFinancialState(t, "75.00", 4)
+	crossRefund := h.wager(t, h.providerB, "b-refund-key-"+uuid.NewString(), "", "b-refund-"+uuid.NewString(), "REFUND", "5.00",
+		fmt.Sprintf(`,"referenceExternalTransactionId":"%s"`, aOnlyBetID))
+	if crossRefund.StatusCode != http.StatusAccepted || !strings.Contains(crossRefund.Body, `"status":"PENDING_REFERENCE"`) {
+		t.Fatalf("cross-provider reference must stay unresolved: %d %s", crossRefund.StatusCode, crossRefund.Body)
+	}
+	h.assertFinancialState(t, "75.00", 4)
+
+	// 7. Stored balance still matches the ledger.
+	reconciliation := h.do(t, http.MethodPost, "/wallets/"+h.walletID.String()+"/reconciliation", h.internal, "", "")
+	if reconciliation.StatusCode != http.StatusOK || !strings.Contains(reconciliation.Body, `"consistent":true`) {
+		t.Fatalf("reconciliation failed: %d %s", reconciliation.StatusCode, reconciliation.Body)
 	}
 }
 

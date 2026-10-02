@@ -8,6 +8,10 @@
       {
         "name": "wallet-internal",
         "description": "Allows internal service operations on wallets"
+      },
+      {
+        "name": "wagering-provider",
+        "description": "Allows a game provider to submit and query its own wagering transactions"
       }
     ]
   },
@@ -92,7 +96,9 @@
           "provider-a"
         ]
       },
-      "realmRoles": [],
+      "realmRoles": [
+        "wagering-provider"
+      ],
       "firstName": "Provider",
       "lastName": "A"
     },
@@ -114,7 +120,9 @@
           "provider-b"
         ]
       },
-      "realmRoles": [],
+      "realmRoles": [
+        "wagering-provider"
+      ],
       "firstName": "Provider",
       "lastName": "B"
     },

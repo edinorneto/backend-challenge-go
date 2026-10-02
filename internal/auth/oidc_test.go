@@ -190,3 +190,102 @@ func TestMiddlewareRejectsMissingRole(t *testing.T) {
 		t.Fatalf("expected 403, got %d", response.Code)
 	}
 }
+
+func (s oidcTestServer) signClaims(t *testing.T, claims jwt.MapClaims) string {
+	t.Helper()
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token.Header["kid"] = "test-key"
+	signed, err := token.SignedString(s.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signed
+}
+
+func TestVerifierRejectsMissingProviderClaim(t *testing.T) {
+	server := newOIDCTestServer(t)
+	token := server.signClaims(t, jwt.MapClaims{
+		"iss": server.server.URL,
+		"sub": "subject-without-provider",
+		"aud": "backend-api",
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"iat": time.Now().Add(-time.Minute).Unix(),
+	})
+	if _, err := server.verifier(t).Verify(context.Background(), token); err == nil {
+		t.Fatal("expected missing provider claim error")
+	}
+}
+
+func TestVerifierRejectsEmptyProviderClaim(t *testing.T) {
+	server := newOIDCTestServer(t)
+	token := server.signClaims(t, jwt.MapClaims{
+		"iss":         server.server.URL,
+		"sub":         "subject-empty-provider",
+		"aud":         "backend-api",
+		"exp":         time.Now().Add(time.Hour).Unix(),
+		"iat":         time.Now().Add(-time.Minute).Unix(),
+		"provider_id": "  ",
+	})
+	if _, err := server.verifier(t).Verify(context.Background(), token); err == nil {
+		t.Fatal("expected empty provider claim error")
+	}
+}
+
+func roleToken(t *testing.T, server oidcTestServer, roles ...string) string {
+	t.Helper()
+	return server.signClaims(t, jwt.MapClaims{
+		"iss":          server.server.URL,
+		"sub":          "subject",
+		"aud":          "backend-api",
+		"exp":          time.Now().Add(time.Hour).Unix(),
+		"iat":          time.Now().Add(-time.Minute).Unix(),
+		"provider_id":  "provider-a",
+		"realm_access": map[string]any{"roles": roles},
+	})
+}
+
+func serveWithToken(handler http.Handler, token string) int {
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response.Code
+}
+
+func TestMiddlewareRoleAuthorization(t *testing.T) {
+	server := newOIDCTestServer(t)
+	middleware := NewMiddleware(server.verifier(t))
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, found := IdentityFromContext(r.Context()); !found {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	providerToken := roleToken(t, server, RoleWageringProvider)
+	internalToken := roleToken(t, server, RoleWalletInternal)
+	noRoleToken := roleToken(t, server)
+
+	cases := []struct {
+		name    string
+		handler http.Handler
+		token   string
+		want    int
+	}{
+		{"provider on provider route", middleware.Require(ok, RoleWageringProvider), providerToken, http.StatusNoContent},
+		{"internal on provider route", middleware.Require(ok, RoleWageringProvider), internalToken, http.StatusForbidden},
+		{"no role on provider route", middleware.Require(ok, RoleWageringProvider), noRoleToken, http.StatusForbidden},
+		{"provider on internal route", middleware.Require(ok, RoleWalletInternal), providerToken, http.StatusForbidden},
+		{"internal on internal route", middleware.Require(ok, RoleWalletInternal), internalToken, http.StatusNoContent},
+		{"provider on shared route", middleware.RequireAny(ok, RoleWageringProvider, RoleWalletInternal), providerToken, http.StatusNoContent},
+		{"internal on shared route", middleware.RequireAny(ok, RoleWageringProvider, RoleWalletInternal), internalToken, http.StatusNoContent},
+		{"no role on shared route", middleware.RequireAny(ok, RoleWageringProvider, RoleWalletInternal), noRoleToken, http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := serveWithToken(tc.handler, tc.token); got != tc.want {
+				t.Fatalf("expected %d, got %d", tc.want, got)
+			}
+		})
+	}
+}

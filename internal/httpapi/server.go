@@ -84,13 +84,16 @@ func (s *Server) Handler() http.Handler {
 	if s.metrics != nil {
 		mux.Handle("/metrics", s.metrics.Handler())
 	}
-	mux.Handle("POST /wallets", s.auth.Require(http.HandlerFunc(s.walletsHandler), "wallet-internal"))
-	mux.Handle("GET /wallets/{walletID}", s.auth.Require(http.HandlerFunc(s.getWalletHandler), "wallet-internal"))
-	mux.Handle("GET /wallets/{walletID}/ledger", s.auth.Require(http.HandlerFunc(s.getLedgerHandler), "wallet-internal"))
-	mux.Handle("POST /wallets/{walletID}/reconciliation", s.auth.Require(http.HandlerFunc(s.reconciliationHandler), "wallet-internal"))
-	mux.Handle("POST /wagering/transactions", s.auth.Require(http.HandlerFunc(s.wageringHandler)))
-	mux.Handle("GET /wagering/transactions/{transactionID}", s.auth.Require(http.HandlerFunc(s.getTransactionHandler)))
-	mux.Handle("GET /providers/{providerID}/wagering/transactions/{externalTransactionID}", s.auth.Require(http.HandlerFunc(s.getExternalTransactionHandler)))
+	// Wallet operations are restricted to the internal service.
+	mux.Handle("POST /wallets", s.auth.Require(http.HandlerFunc(s.walletsHandler), auth.RoleWalletInternal))
+	mux.Handle("GET /wallets/{walletID}", s.auth.Require(http.HandlerFunc(s.getWalletHandler), auth.RoleWalletInternal))
+	mux.Handle("GET /wallets/{walletID}/ledger", s.auth.Require(http.HandlerFunc(s.getLedgerHandler), auth.RoleWalletInternal))
+	mux.Handle("POST /wallets/{walletID}/reconciliation", s.auth.Require(http.HandlerFunc(s.reconciliationHandler), auth.RoleWalletInternal))
+	// Wagering operations are submitted only by providers, for their own provider ID.
+	mux.Handle("POST /wagering/transactions", s.auth.Require(http.HandlerFunc(s.wageringHandler), auth.RoleWageringProvider))
+	mux.Handle("GET /providers/{providerID}/wagering/transactions/{externalTransactionID}", s.auth.Require(http.HandlerFunc(s.getExternalTransactionHandler), auth.RoleWageringProvider))
+	// Transaction reads: providers see their own transactions; the internal service sees all.
+	mux.Handle("GET /wagering/transactions/{transactionID}", s.auth.RequireAny(http.HandlerFunc(s.getTransactionHandler), auth.RoleWageringProvider, auth.RoleWalletInternal))
 
 	return loggingMiddleware(mux, s.logger, s.metrics)
 }
@@ -412,7 +415,7 @@ func (s *Server) getTransactionHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 		return
 	}
-	if !identity.HasRole("wallet-internal") && identity.ProviderID != transaction.ProviderID {
+	if !identity.HasRole(auth.RoleWalletInternal) && identity.ProviderID != transaction.ProviderID {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "provider_access_denied"})
 		return
 	}
@@ -490,6 +493,7 @@ func (s *Server) wageringHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
+		ProviderID            string `json:"providerId"`
 		ExternalTransactionID string `json:"externalTransactionId"`
 		PlayerID              string `json:"playerId"`
 		WalletID              string `json:"walletId"`
@@ -546,6 +550,13 @@ func (s *Server) wageringHandler(w http.ResponseWriter, r *http.Request) {
 	identity, ok := auth.IdentityFromContext(r.Context())
 	if !ok || identity.ProviderID == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "provider_identity_required"})
+		return
+	}
+	// The authenticated identity is the only source of the provider. A body
+	// providerId is optional; when present it must match, otherwise the request
+	// is refused before any financial processing.
+	if bodyProvider := strings.TrimSpace(req.ProviderID); bodyProvider != "" && bodyProvider != identity.ProviderID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "provider_mismatch"})
 		return
 	}
 

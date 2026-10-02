@@ -29,10 +29,16 @@ HTTP wallet and wagering routes are protected by an OIDC middleware. The
 middleware validates Bearer tokens using the configured issuer and JWKS,
 including expiration and audience when configured, then places an identity in
 the request context. Wagering derives `provider_id` exclusively from the
-configured provider claim, so a body field cannot switch providers. Wallet
-creation and reads require the `wallet-internal` role and are restricted to
-the `backend-internal` service account; provider users do not receive wallet
-roles. The public `/health/live` endpoint reports process liveness. The public
+configured provider claim, so a body field cannot switch providers: an absent
+body `providerId` is accepted, a matching one is accepted and a different one is
+refused with `403 provider_mismatch` before the use case runs. Authorization is
+role based on Keycloak realm roles: `wallet-internal` (only the
+`backend-internal` service account) for wallet creation, reads, ledger and
+reconciliation; `wagering-provider` (provider users) for submitting operations
+and provider lookups. Provider isolation is also enforced below HTTP:
+idempotency keys, external IDs and reference resolution are all scoped by
+`provider_id` in the unique indexes and queries, so replays and reversals never
+cross providers. The public `/health/live` endpoint reports process liveness. The public
 `/health/ready` endpoint checks PostgreSQL and SQS readiness, returning `200`
 with `{"status":"ready"}` when both are available and `503` with
 `{"status":"not_ready","checks":{"postgres":"ok|error","sqs":"ok|error"}}`

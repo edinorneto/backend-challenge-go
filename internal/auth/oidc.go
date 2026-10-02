@@ -16,6 +16,16 @@ import (
 
 type identityKey struct{}
 
+// Realm roles that define the permission model of the API.
+const (
+	// RoleWalletInternal is granted only to the internal service account and
+	// authorizes wallet operations (create, read, ledger, reconciliation).
+	RoleWalletInternal = "wallet-internal"
+	// RoleWageringProvider is granted to game providers and authorizes
+	// submitting and querying their own wagering transactions.
+	RoleWageringProvider = "wagering-provider"
+)
+
 type Identity struct {
 	ProviderID string
 	Subject    string
@@ -114,7 +124,31 @@ func NewMiddleware(verifier *Verifier) *Middleware {
 	return &Middleware{verifier: verifier}
 }
 
+// Require authenticates the request and demands every listed role.
 func (m *Middleware) Require(next http.Handler, roles ...string) http.Handler {
+	return m.authenticate(next, func(identity Identity) bool {
+		for _, role := range roles {
+			if !identity.HasRole(role) {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// RequireAny authenticates the request and demands at least one listed role.
+func (m *Middleware) RequireAny(next http.Handler, roles ...string) http.Handler {
+	return m.authenticate(next, func(identity Identity) bool {
+		for _, role := range roles {
+			if identity.HasRole(role) {
+				return true
+			}
+		}
+		return len(roles) == 0
+	})
+}
+
+func (m *Middleware) authenticate(next http.Handler, authorized func(Identity) bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if m == nil || m.verifier == nil {
 			http.Error(w, `{"error":"authentication_unavailable"}`, http.StatusServiceUnavailable)
@@ -132,11 +166,9 @@ func (m *Middleware) Require(next http.Handler, roles ...string) http.Handler {
 			http.Error(w, `{"error":"invalid_token"}`, http.StatusUnauthorized)
 			return
 		}
-		for _, role := range roles {
-			if !identity.HasRole(role) {
-				http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
-				return
-			}
+		if !authorized(identity) {
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			return
 		}
 		next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), identity)))
 	})

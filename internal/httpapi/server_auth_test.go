@@ -52,28 +52,52 @@ func (authTestWalletRepo) Reconcile(context.Context, uuid.UUID) (ports.Reconcili
 	return ports.ReconciliationView{}, nil
 }
 
-func TestWageringUsesAuthenticatedProviderInsteadOfBody(t *testing.T) {
+func wageringRequestAs(providerInBody, authenticatedProvider string) *http.Request {
+	providerField := ""
+	if providerInBody != "" {
+		providerField = `"providerId":"` + providerInBody + `",`
+	}
+	body := `{` + providerField + `"externalTransactionId":"external-1","playerId":"` + uuid.NewString() + `","walletId":"` + uuid.NewString() + `","roundId":"round","gameId":"game","kind":"BET","money":{"amount":"1.00","currency":"BRL"}}`
+	request := httptest.NewRequest(http.MethodPost, "/wagering/transactions", strings.NewReader(body))
+	request.Header.Set("Idempotency-Key", "idem-1")
+	return request.WithContext(auth.WithIdentity(request.Context(), auth.Identity{
+		ProviderID: authenticatedProvider,
+		Subject:    "subject-" + authenticatedProvider,
+		Roles:      map[string]struct{}{auth.RoleWageringProvider: {}},
+	}))
+}
+
+func TestWageringUsesAuthenticatedProvider(t *testing.T) {
+	for _, bodyProvider := range []string{"", "provider-a"} {
+		repo := &authTestWageringRepo{}
+		server := &Server{
+			wallets:  application.NewWalletService(authTestWalletRepo{}),
+			wagering: application.NewWageringService(repo),
+		}
+		response := httptest.NewRecorder()
+		server.wageringHandler(response, wageringRequestAs(bodyProvider, "provider-a"))
+		if response.Code != http.StatusOK {
+			t.Fatalf("body provider %q: expected 200, got %d: %s", bodyProvider, response.Code, response.Body.String())
+		}
+		if repo.request.ProviderID != "provider-a" {
+			t.Fatalf("body provider %q: expected authenticated provider provider-a, got %q", bodyProvider, repo.request.ProviderID)
+		}
+	}
+}
+
+func TestWageringRejectsBodyProviderMismatchBeforeProcessing(t *testing.T) {
 	repo := &authTestWageringRepo{}
 	server := &Server{
 		wallets:  application.NewWalletService(authTestWalletRepo{}),
 		wagering: application.NewWageringService(repo),
 	}
-
-	playerID := uuid.New()
-	walletID := uuid.New()
-	body := `{"providerId":"provider-b","externalTransactionId":"external-1","playerId":"` + playerID.String() + `","walletId":"` + walletID.String() + `","roundId":"round","gameId":"game","kind":"BET","money":{"amount":"1.00","currency":"BRL"}}`
-	request := httptest.NewRequest(http.MethodPost, "/wagering/transactions", strings.NewReader(body))
-	request.Header.Set("Idempotency-Key", "idem-1")
-	request = request.WithContext(auth.WithIdentity(request.Context(), auth.Identity{ProviderID: "provider-a", Subject: "subject-a"}))
 	response := httptest.NewRecorder()
-
-	server.wageringHandler(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	server.wageringHandler(response, wageringRequestAs("provider-b", "provider-a"))
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "provider_mismatch") {
+		t.Fatalf("expected 403 provider_mismatch, got %d: %s", response.Code, response.Body.String())
 	}
-	if repo.request.ProviderID != "provider-a" {
-		t.Fatalf("expected authenticated provider provider-a, got %q", repo.request.ProviderID)
+	if repo.request.ProviderID != "" {
+		t.Fatalf("mismatched request must not reach processing, got provider %q", repo.request.ProviderID)
 	}
 }
 
