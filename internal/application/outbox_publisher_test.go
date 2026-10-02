@@ -18,7 +18,6 @@ type fakeOutboxRepo struct {
 	claimed       []ports.OutboxEvent
 	published     []uuid.UUID
 	didReschedule bool
-	failed        bool
 }
 
 func (r *fakeOutboxRepo) ClaimPending(ctx context.Context, limit int, leaseDuration time.Duration, owner string) ([]ports.OutboxEvent, error) {

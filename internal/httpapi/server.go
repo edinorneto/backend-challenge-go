@@ -329,10 +329,6 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func trimTrailingSlash(value string) string {
-	return strings.TrimRight(value, "/")
-}
-
 func (s *Server) getWalletHandler(w http.ResponseWriter, r *http.Request) {
 	walletID, err := uuid.Parse(r.PathValue("walletID"))
 	if err != nil {

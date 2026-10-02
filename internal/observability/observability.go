@@ -176,17 +176,17 @@ func (m *Metrics) Handler() http.Handler {
 			families[familyName(series)] = append(families[familyName(series)], series)
 		}
 		for _, family := range sortedKeys(families) {
-			fmt.Fprintf(w, "# TYPE %s counter\n", family)
+			_, _ = fmt.Fprintf(w, "# TYPE %s counter\n", family)
 			for _, series := range families[family] {
-				fmt.Fprintf(w, "%s %d\n", series, m.counters[series])
+				_, _ = fmt.Fprintf(w, "%s %d\n", series, m.counters[series])
 			}
 		}
 		for _, name := range sortedKeys(m.gauges) {
-			fmt.Fprintf(w, "# TYPE %s gauge\n%s %g\n", name, name, m.gauges[name])
+			_, _ = fmt.Fprintf(w, "# TYPE %s gauge\n%s %g\n", name, name, m.gauges[name])
 		}
 		for _, name := range sortedKeys(m.hist) {
 			value := m.hist[name]
-			fmt.Fprintf(w, "# TYPE %s_seconds summary\n%s_seconds_count %d\n%s_seconds_sum %f\n", name, name, value.count, name, value.sum)
+			_, _ = fmt.Fprintf(w, "# TYPE %s_seconds summary\n%s_seconds_count %d\n%s_seconds_sum %f\n", name, name, value.count, name, value.sum)
 		}
 	})
 }

@@ -88,7 +88,7 @@ func (r *WalletRepo) Create(ctx context.Context, w *wallet.Wallet) error {
 		return fmt.Errorf("begin wallet transaction: %w", err)
 	}
 
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	_, err = tx.Exec(
 		ctx,
@@ -427,7 +427,7 @@ func (r *WalletRepo) Reconcile(ctx context.Context, walletID uuid.UUID) (ports.R
 	if err != nil {
 		return ports.ReconciliationView{}, fmt.Errorf("begin reconciliation: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var storedCents int64
 	var currency string
@@ -487,7 +487,7 @@ func (r *WalletRepo) ProcessTransaction(
 		}
 	}
 	if ownsTx {
-		defer tx.Rollback(ctx)
+		defer func() { _ = tx.Rollback(ctx) }()
 	}
 
 	transactionID := uuid.New()
@@ -997,7 +997,7 @@ func (r *WalletRepo) RetryPendingReference(ctx context.Context, transactionID uu
 	if err != nil {
 		return ports.ProcessTransactionResult{}, fmt.Errorf("begin reference retry: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	result, err := r.retryPendingReferenceTx(ctx, tx, transactionID)
 	if err != nil {
@@ -1016,7 +1016,7 @@ func (r *WalletRepo) ProcessNextPendingReference(ctx context.Context) (bool, err
 	if err != nil {
 		return false, fmt.Errorf("begin pending reference worker transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var transactionID uuid.UUID
 	err = tx.QueryRow(ctx, `

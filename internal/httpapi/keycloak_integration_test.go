@@ -380,7 +380,7 @@ func keycloakToken(t *testing.T, ctx context.Context, grantType, username, passw
 	if err != nil {
 		t.Skipf("Keycloak unavailable: %v", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		t.Skipf("Keycloak token endpoint unavailable or realm not imported: status=%d", response.StatusCode)
 	}
@@ -478,7 +478,7 @@ func doHTTP(t *testing.T, client *http.Client, endpoint, token, method, idempote
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	content, _ := io.ReadAll(response.Body)
 	return httpResponse{StatusCode: response.StatusCode, Body: string(content)}
 }

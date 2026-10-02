@@ -28,11 +28,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *direction != "up" && *direction != "down" {
-		fmt.Fprintln(stderr, "direction must be up or down")
+		_, _ = fmt.Fprintln(stderr, "direction must be up or down")
 		return 2
 	}
 	if *direction == "down" && *steps < 1 {
-		fmt.Fprintln(stderr, "steps must be at least 1")
+		_, _ = fmt.Fprintln(stderr, "steps must be at least 1")
 		return 2
 	}
 
@@ -46,13 +46,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
-		fmt.Fprintf(stderr, "create PostgreSQL pool: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "create PostgreSQL pool: %v\n", err)
 		return 1
 	}
 	defer pool.Close()
 
 	if err := pool.Ping(ctx); err != nil {
-		fmt.Fprintf(stderr, "ping PostgreSQL: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "ping PostgreSQL: %v\n", err)
 		return 1
 	}
 
@@ -62,10 +62,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = migrations.Revert(ctx, pool, *steps)
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "migration %s failed: %v\n", *direction, err)
+		_, _ = fmt.Fprintf(stderr, "migration %s failed: %v\n", *direction, err)
 		return 1
 	}
 
-	fmt.Fprintf(stdout, "migration %s completed\n", *direction)
+	_, _ = fmt.Fprintf(stdout, "migration %s completed\n", *direction)
 	return 0
 }

@@ -527,7 +527,7 @@ func token(t *testing.T, form url.Values) string {
 	if err != nil {
 		t.Skipf("Keycloak unavailable: %v", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	var payload struct {
 		AccessToken string `json:"access_token"`
 	}
@@ -587,7 +587,7 @@ func do(t *testing.T, request *http.Request) (int, []byte) {
 			continue
 		}
 		body, _ := io.ReadAll(response.Body)
-		response.Body.Close()
+		_ = response.Body.Close()
 		switch response.StatusCode {
 		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 			lastErr = fmt.Errorf("status %d", response.StatusCode)

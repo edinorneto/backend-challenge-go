@@ -46,7 +46,7 @@ func (r *InboxRepo) Process(
 		}
 	}
 	if ownsTx {
-		defer tx.Rollback(ctx)
+		defer func() { _ = tx.Rollback(ctx) }()
 	}
 
 	var inboxID uuid.UUID

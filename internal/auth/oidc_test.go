@@ -31,7 +31,7 @@ func newOIDCTestServer(t *testing.T) oidcTestServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n := base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes())
+	n := base64.RawURLEncoding.EncodeToString(key.N.Bytes())
 	e := base64.RawURLEncoding.EncodeToString([]byte{1, 0, 1})
 	body, _ := json.Marshal(map[string]any{"keys": []map[string]string{{
 		"kty": "RSA", "kid": "test-key", "use": "sig", "alg": "RS256", "n": n, "e": e,

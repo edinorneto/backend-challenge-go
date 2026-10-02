@@ -107,11 +107,11 @@ func (c *Consumer) Receive(ctx context.Context, batchSize int, waitTimeSeconds i
 		batchSize = 10
 	}
 	output, err := c.client.api.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
-		QueueUrl:            &c.queueURL,
-		MaxNumberOfMessages: int32(batchSize),
-		WaitTimeSeconds:     int32(waitTimeSeconds),
-		VisibilityTimeout:   int32(visibilityTimeoutSeconds),
-		AttributeNames:      []types.QueueAttributeName{types.QueueAttributeNameAll},
+		QueueUrl:                    &c.queueURL,
+		MaxNumberOfMessages:         int32(batchSize),
+		WaitTimeSeconds:             int32(waitTimeSeconds),
+		VisibilityTimeout:           int32(visibilityTimeoutSeconds),
+		MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameAll},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("receive SQS messages: %w", err)

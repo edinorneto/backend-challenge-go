@@ -398,7 +398,7 @@ func TestProcessTransactionDifferentWalletsDoNotWaitForEachOther(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer holder.Rollback(ctx)
+	defer func() { _ = holder.Rollback(ctx) }()
 	if _, err := holder.Exec(ctx, `SELECT id FROM wallets WHERE id = $1 FOR UPDATE`, lockedWalletID); err != nil {
 		t.Fatal(err)
 	}
@@ -1356,7 +1356,7 @@ func TestProcessTransactionConcurrentBetsDoNotDeadlock(t *testing.T) {
 				t.Fatalf("round %d request %d failed: %v", round, index, err)
 			}
 		}
-		if !(statuses[0] == "PROCESSED" && statuses[1] == "REJECTED") && !(statuses[0] == "REJECTED" && statuses[1] == "PROCESSED") {
+		if (statuses[0] != "PROCESSED" || statuses[1] != "REJECTED") && (statuses[0] != "REJECTED" || statuses[1] != "PROCESSED") {
 			t.Fatalf("round %d: expected one processed and one rejected bet, got %v", round, statuses)
 		}
 	}
