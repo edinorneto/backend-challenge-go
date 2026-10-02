@@ -80,6 +80,7 @@ Keycloak issues every token; the API never handles passwords. Test identities:
 | --- | --- | --- | --- |
 | `provider-a` / `provider-a`, `provider-b` / `provider-b` (client `backend-api`) | `password` | `wagering-provider`, claim `provider_id` | `POST /wagering/transactions`, `GET /providers/{own id}/...`, `GET /wagering/transactions/{id}` (own only) |
 | client `backend-internal`, secret `backend-internal-secret` | `client_credentials` | `wallet-internal` | wallets, ledger, reconciliation, `GET /wagering/transactions/{id}` (any) |
+| **Tests only:** the provider users above through client `backend-api-short-lived` | `password` | `wagering-provider`, claim `provider_id` | same as the provider users, but the token expires after **2 s**; used only by `TestKeycloakExpiredTokenIsRejected` and not meant for a production realm |
 
 ```sh
 curl -s -X POST http://localhost:8081/realms/backend/protocol/openid-connect/token \
@@ -89,7 +90,19 @@ curl -s -X POST http://localhost:8081/realms/backend/protocol/openid-connect/tok
   -d grant_type=client_credentials -d client_id=backend-internal -d client_secret=backend-internal-secret
 ```
 
-Use the `access_token` as `Authorization: Bearer <token>`. The provider of a
+Use the `access_token` as `Authorization: Bearer <token>`. The examples below
+keep the two tokens in shell variables (with `jq`; any JSON tool works):
+
+```sh
+TOKEN_URL=http://localhost:8081/realms/backend/protocol/openid-connect/token
+PROVIDER=$(curl -s -X POST $TOKEN_URL -d grant_type=password -d client_id=backend-api \
+  -d username=provider-a -d password=provider-a | jq -r .access_token)
+INTERNAL=$(curl -s -X POST $TOKEN_URL -d grant_type=client_credentials -d client_id=backend-internal \
+  -d client_secret=backend-internal-secret | jq -r .access_token)
+```
+
+Provider tokens last 5 minutes (the realm default), so request a new one when a
+call answers `401 invalid_token`. The provider of a
 wagering operation is taken only from the token. A `providerId` in the body is
 optional, and if it differs from the token the request is refused with
 `403 provider_mismatch`.
@@ -109,6 +122,9 @@ curl -s -X POST localhost:8080/wallets -H "Authorization: Bearer $INTERNAL" -H '
 ```json
 {"balance":{"amount":"1000.00","currency":"BRL"},"id":"4fccdbd9-1439-4ddc-a375-cf5e047001b6","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","version":1}
 ```
+
+The wallet `id` is new on every run. Keep yours as `WALLET=<id>` and put it in
+`walletId` below, in place of the ID of this example.
 
 Submit a bet (provider). The `Idempotency-Key` header is required:
 
@@ -274,7 +290,7 @@ and `2` on invalid usage.
 | --- | --- | --- |
 | `go vet ./...` | nothing | static checks |
 | `go test ./...` | nothing | unit tests. Tests that need PostgreSQL, SQS or Keycloak **skip** when they are not reachable, so a green run here does not prove the integration |
-| `go test -tags=integration -count=1 ./...` | the Compose stack | unit and integration tests against the real PostgreSQL, LocalStack and Keycloak (about 245 tests) |
+| `go test -tags=integration -count=1 ./...` | the Compose stack | unit and integration tests against the real PostgreSQL, LocalStack and Keycloak (about 260 tests, counting subtests) |
 | `go test -race -tags=integration -count=1 ./...` | the stack, cgo | the same with the race detector |
 | `go test -tags=e2e -count=1 -v ./test/e2e/` | the stack and the `docker` CLI | end-to-end scenarios through Nginx and the three replicas |
 
@@ -291,6 +307,9 @@ docker run --rm --network host -v "$PWD":/src -w /src \
   -e DATABASE_URL="postgres://postgres:postgres@localhost:5432/betting?sslmode=disable" \
   golang:1.27.1 go test -race -tags=integration -count=1 ./...
 ```
+
+In Git Bash on Windows, prefix the command with `MSYS_NO_PATHCONV=1` and use
+`"$(pwd -W)"` in place of `"$PWD"`, or the volume path is rewritten.
 
 Integration tests that change shared state (claims of pending references, the
 outbox, migrations) run in their own PostgreSQL schema, so they do not interfere
