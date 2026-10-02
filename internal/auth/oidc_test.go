@@ -348,3 +348,26 @@ func TestMiddlewareErrorsAreJSON(t *testing.T) {
 		t.Fatalf("expected a JSON 401, got %d %q %s", recorder.Code, recorder.Header().Get("Content-Type"), recorder.Body.String())
 	}
 }
+
+// The middleware fills the identity recorder that an outer middleware placed in
+// the context, so the request log can name the provider.
+func TestMiddlewareFillsIdentityRecorder(t *testing.T) {
+	server := newOIDCTestServer(t)
+	handler := NewMiddleware(server.verifier(t)).Require(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), RoleWageringProvider)
+
+	request := httptest.NewRequest(http.MethodGet, "/providers/provider-a/transactions/x", nil)
+	request.Header.Set("Authorization", "Bearer "+roleToken(t, server, RoleWageringProvider))
+	ctx := WithIdentityRecorder(request.Context())
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request.WithContext(ctx))
+
+	identity, ok := RecordedIdentity(ctx)
+	if recorder.Code != http.StatusNoContent || !ok || identity.ProviderID != "provider-a" {
+		t.Fatalf("expected the recorded provider-a identity, got status=%d ok=%v identity=%+v", recorder.Code, ok, identity)
+	}
+	if _, ok := RecordedIdentity(context.Background()); ok {
+		t.Fatal("a context without a recorder has no recorded identity")
+	}
+}

@@ -260,7 +260,9 @@ func loggingMiddleware(next http.Handler, logger *observability.Logger, metrics 
 		if correlationID == "" {
 			correlationID = uuid.NewString()
 		}
-		r = r.WithContext(observability.WithCorrelationID(r.Context(), correlationID))
+		// The recorder lets this outer middleware log the provider that the
+		// authentication middleware, further in, resolves from the token.
+		r = r.WithContext(auth.WithIdentityRecorder(observability.WithCorrelationID(r.Context(), correlationID)))
 		w.Header().Set("Correlation-ID", correlationID)
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
@@ -284,7 +286,7 @@ func loggingMiddleware(next http.Handler, logger *observability.Logger, metrics 
 				"status":   strconv.Itoa(recorder.status),
 				"duration": time.Since(start).String(),
 			}
-			if identity, ok := auth.IdentityFromContext(r.Context()); ok {
+			if identity, ok := auth.RecordedIdentity(r.Context()); ok && identity.ProviderID != "" {
 				fields["providerId"] = identity.ProviderID
 			}
 			logger.Info(r.Context(), "http_request", fields)

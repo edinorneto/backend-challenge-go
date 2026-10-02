@@ -38,7 +38,33 @@ func (i Identity) HasRole(role string) bool {
 }
 
 func WithIdentity(ctx context.Context, identity Identity) context.Context {
+	if recorder, ok := ctx.Value(identityRecorderKey{}).(*identityRecorder); ok {
+		recorder.identity, recorder.set = identity, true
+	}
 	return context.WithValue(ctx, identityKey{}, identity)
+}
+
+type identityRecorderKey struct{}
+
+type identityRecorder struct {
+	identity Identity
+	set      bool
+}
+
+// WithIdentityRecorder lets an outer middleware see the identity authenticated
+// further down the chain: the request context only flows inwards, so the
+// authentication middleware fills this shared slot through WithIdentity.
+func WithIdentityRecorder(ctx context.Context) context.Context {
+	return context.WithValue(ctx, identityRecorderKey{}, &identityRecorder{})
+}
+
+// RecordedIdentity returns the identity recorded under WithIdentityRecorder.
+func RecordedIdentity(ctx context.Context) (Identity, bool) {
+	recorder, ok := ctx.Value(identityRecorderKey{}).(*identityRecorder)
+	if !ok || !recorder.set {
+		return Identity{}, false
+	}
+	return recorder.identity, true
 }
 
 func IdentityFromContext(ctx context.Context) (Identity, bool) {
