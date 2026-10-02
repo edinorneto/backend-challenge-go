@@ -120,6 +120,17 @@ func TestRunnerDownRevertsLatestMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Migrations newer than 000005 are reverted first, one step at a time; the
+	// steps below then check the reverts of 000005 and 000004 as before.
+	for version := latest; version > 5; version-- {
+		if err := runner.Down(ctx, 1); err != nil {
+			t.Fatalf("down migration %d: %v", version, err)
+		}
+		assertMigrationCount(t, pool, int(version-1))
+	}
+	assertExists(t, pool, `SELECT to_regclass('uq_wager_processed_reversal_reference') IS NOT NULL`, false, "one reversal per reference index")
+	latest = min(latest, 5)
+
 	if err := runner.Down(ctx, 1); err != nil {
 		t.Fatalf("down one: %v", err)
 	}

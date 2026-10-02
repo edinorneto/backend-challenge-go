@@ -232,6 +232,7 @@ version):
 | `000003_outbox_last_error` | `outbox_events.last_error` |
 | `000004_outbox_immutable_snapshot` | Trigger that keeps the outbox event snapshot immutable |
 | `000005_opening_once_per_wallet` | At most one `OPENING` (initial credit) per wallet |
+| `000006_one_reversal_per_reference` | At most one processed `REFUND`/`ROLLBACK` per reference, across kinds |
 
 **Apply.** Every replica applies the pending versions on startup, under a
 PostgreSQL advisory lock, so concurrent replicas apply each version once. Each

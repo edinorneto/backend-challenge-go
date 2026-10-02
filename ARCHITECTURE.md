@@ -163,6 +163,7 @@ deduplication):
 | Unique operation per provider | `uq_wager_provider_idempotency_key`, `uq_wager_provider_external_transaction` |
 | One initial credit per wallet | `uq_wager_opening_per_wallet` (migration `000005`) |
 | One processed reversal per reference and kind | `uq_wager_processed_reversal_reference_kind` |
+| One processed reversal per reference, any kind | `uq_wager_processed_reversal_reference` (migration `000006`) |
 | One ledger entry per wallet and transaction | `uq_ledger_wallet_transaction` |
 | Append-only ledger | triggers reject every `UPDATE` and `DELETE` on `wallet_ledger_entries` |
 | Immutable outbox snapshot | trigger rejects updates of the event columns (`000004`) |
@@ -192,9 +193,10 @@ other reversal of that bet is `reversal_already_processed`. The returned debit
 can therefore never be credited twice. A `WIN` and a `REFUND` can each be
 rolled back once. Rolling back a `REFUND` debits the refunded amount again, and
 the bet stays reversed, so it cannot be refunded a second time. The uniqueness
-per reference and kind is also a database index; the cross-kind rule for bets is
-checked under the lock of the referenced row, which serializes reversals of one
-reference. A reversal that would need to debit more than the balance is
+per reference, across kinds, is also a database index (migration `000006`). The
+repository checks the same rule first, under the lock of the referenced row,
+which serializes reversals of one reference and turns a second one into a
+stored `reversal_already_processed` rejection. A reversal that would need to debit more than the balance is
 rejected with `reversal_insufficient_funds`, which is distinct from a bet's
 `insufficient_funds`.
 
