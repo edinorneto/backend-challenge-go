@@ -103,12 +103,12 @@ func (w *ReferenceWorker) loop(ctx context.Context) {
 				log.Printf("reference worker: %v", err)
 			}
 			if w.metrics != nil {
-				w.metrics.Inc("reference_retries_total")
+				w.metrics.Inc("reference_worker_failures_total")
 			}
 		}
 		if processed {
 			if w.metrics != nil {
-				w.metrics.Inc("reconciliation_processed_total")
+				w.metrics.Inc("reference_worker_processed_total")
 			}
 			continue
 		}

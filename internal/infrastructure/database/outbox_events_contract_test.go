@@ -168,7 +168,18 @@ func TestReferenceExpiryRejectionEventCarriesOperationData(t *testing.T) {
 		t.Fatalf("expected expiry rejection, got %s", result.Status)
 	}
 
-	rejected := findEvent(t, loadOutboxEvents(t, pool, result.TransactionID), messaging.EventTypeWagerTransactionRejected)
+	if result.Balance.String() != "100.00" {
+		t.Fatalf("expected the expiry rejection to report the observed wallet balance, got %s", result.Balance)
+	}
+	events := loadOutboxEvents(t, pool, result.TransactionID)
+	// Retries only advance the backoff: the wait is announced once.
+	findEvent(t, events, messaging.EventTypeWagerTransactionPendingReference)
+	rejected := findEvent(t, events, messaging.EventTypeWagerTransactionRejected)
+	rejectedResult, _ := rejected.payload["result"].(map[string]any)
+	assertMoney(t, rejectedResult["balance"], "100.00")
+	if rejectedResult["version"] != float64(1) {
+		t.Fatalf("expected observed wallet version 1, got %v", rejectedResult["version"])
+	}
 	assertPayload(t, rejected, map[string]any{
 		"playerId":                       playerID.String(),
 		"walletId":                       walletID.String(),

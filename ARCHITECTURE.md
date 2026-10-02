@@ -112,9 +112,9 @@ with decimal strings, never JSON numbers.
 | Event | Trigger | Fields |
 | --- | --- | --- |
 | `WagerTransactionProcessed` | Successful operation, including `LOSS` and the internal `OPENING` | `transactionId`, `walletId`, `playerId`, `kind`, `status`, `money`, `result.balance`, `result.version`; for external operations also `providerId`, `externalTransactionId`, `roundId`, `gameId` and, for reversals, `referenceExternalTransactionId` |
-| `WagerTransactionRejected` | Definitive business rejection, including reference expiry | same identification fields as above, plus `failureCode`; for reference rejections also `referenceAttempts` and `nextAttemptAt` |
+| `WagerTransactionRejected` | Definitive business rejection, including reference expiry | same identification fields as above, plus `failureCode`; for reference expiry also `referenceAttempts`; `result` holds the wallet balance and version observed at rejection |
 | `WalletBalanceChanged` | Effective balance change (never for `LOSS` or rejections) | `walletId`, `transactionId`, `direction` (`DEBIT`/`CREDIT`), `money`, `balanceBefore`, `balanceAfter`, `walletVersion`, `previousVersion` |
-| `WagerTransactionPendingReference` | Reversal waiting for its reference (on registration and after each failed retry) | `transactionId`, `walletId`, `providerId`, `kind`, `status`, `failureCode`, `referenceExternalTransactionId`, `referenceAttempts`, `nextAttemptAt` |
+| `WagerTransactionPendingReference` | Reversal waiting for its reference (emitted once, when the wait is registered; retries only advance the persisted backoff) | `transactionId`, `walletId`, `providerId`, `kind`, `status`, `failureCode`, `referenceExternalTransactionId`, `referenceAttempts`, `nextAttemptAt` |
 
 `OPENING` is internal: its `WagerTransactionProcessed` omits the external fields
 (`providerId`, `externalTransactionId`, `roundId`, `gameId`) instead of sending
@@ -179,6 +179,39 @@ reference retry transaction completes. The persisted
 exponential backoff and the existing attempt limit. Because the pending state
 is stored in PostgreSQL, a new application instance can recover it after a
 restart, and multiple instances can process different pending rows safely.
+
+### Pending references
+
+A `REFUND` or `ROLLBACK` whose reference does not exist yet is committed as
+`PENDING_REFERENCE` with `failureCode` `reference_pending`, without a ledger
+entry or balance change. HTTP answers `202 Accepted` without a balance, and the
+`WagerTransactionPendingReference` event is emitted once in the same commit.
+
+| Situation found by a retry | Result |
+| --- | --- |
+| Reference missing | Stays pending, increments `reference_attempts` and schedules the next attempt |
+| Reference is `PENDING` or `PENDING_REFERENCE` (e.g. a `ROLLBACK` of a `REFUND` that is still waiting) | Stays pending, same as a missing reference |
+| Reference `PROCESSED` | The reversal is validated and applied like a synchronous one: `PROCESSED`, or `REJECTED` with `reference_incompatible`, `reversal_already_processed` or `reversal_insufficient_funds` |
+| Reference `REJECTED` or `FAILED` | Rejected immediately with `reference_incompatible`; it does not wait |
+| Attempts exhausted | `REJECTED` with `reference_not_found` and a `WagerTransactionRejected` event |
+
+Retry policy: the first attempt runs 1 minute after registration and each
+following delay doubles (1, 2, 4, 8, 16 minutes). After 5 unsuccessful retries
+(`maxReferenceAttempts`), roughly 31 minutes after registration, the operation is
+rejected. The rejection stores the wallet balance and version read at that
+moment, so idempotent replays return them, as they do for other rejections.
+`reference_pending` is a status, not a rejection: the provider should poll
+`GET /wagering/transactions/{id}` or consume the events. `reference_not_found`
+is final for that operation; the provider must send a new operation with another
+`externalTransactionId`.
+
+The worker claims rows in `reference_next_attempt_at` order, one per
+transaction, and takes the same locks as the synchronous path: first the
+reference row, then the wallet. This avoids lock-order inversion between the
+worker and HTTP/SQS. A transaction that fails because of infrastructure (e.g.
+PostgreSQL unavailable) is rolled back without consuming an attempt, and the
+row is picked up again on the next poll (every 1 second).
+Metrics: `reference_worker_processed_total` and `reference_worker_failures_total`.
 
 The Inbox is the durable protection against duplicate delivery and does not
 rely on SQS deduplication alone.

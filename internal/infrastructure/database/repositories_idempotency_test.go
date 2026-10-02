@@ -17,6 +17,7 @@ import (
 	"github.com/edinorneto/backend-challenge-go/internal/domain/money"
 	"github.com/edinorneto/backend-challenge-go/internal/domain/wallet"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database"
+	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database/migrations"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
@@ -515,7 +516,7 @@ func TestProcessTransactionPendingReferencePersistsRetryState(t *testing.T) {
 }
 
 func TestProcessNextPendingReferenceProcessesOnlyDueRows(t *testing.T) {
-	pool := testPool(t)
+	pool := isolatedTestPool(t)
 	repo := database.NewWalletRepo(pool)
 	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
 	amount := testMoney(t, "25.00")
@@ -528,13 +529,6 @@ func TestProcessNextPendingReferenceProcessesOnlyDueRows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := pool.Exec(context.Background(), `
-		UPDATE wager_transactions
-		SET reference_next_attempt_at = NOW() + INTERVAL '1 hour'
-		WHERE status = 'PENDING_REFERENCE' AND id <> $1
-	`, pending.TransactionID); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := pool.Exec(context.Background(), `
 		UPDATE wager_transactions
 		SET reference_next_attempt_at = NOW() + INTERVAL '1 hour'
@@ -577,7 +571,7 @@ func TestProcessNextPendingReferenceProcessesOnlyDueRows(t *testing.T) {
 }
 
 func TestProcessNextPendingReferenceClaimsOnceAcrossConcurrentWorkers(t *testing.T) {
-	pool := testPool(t)
+	pool := isolatedTestPool(t)
 	repo := database.NewWalletRepo(pool)
 	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
 	amount := testMoney(t, "25.00")
@@ -587,13 +581,6 @@ func TestProcessNextPendingReferenceClaimsOnceAcrossConcurrentWorkers(t *testing
 	request.ReferenceExternalTransactionID = "worker-concurrent-missing"
 	pending, err := repo.ProcessTransaction(context.Background(), request)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(context.Background(), `
-		UPDATE wager_transactions
-		SET reference_next_attempt_at = NOW() + INTERVAL '1 hour'
-		WHERE status = 'PENDING_REFERENCE' AND id <> $1
-	`, pending.TransactionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(context.Background(), `
@@ -637,7 +624,7 @@ func TestProcessNextPendingReferenceClaimsOnceAcrossConcurrentWorkers(t *testing
 }
 
 func TestProcessNextPendingReferenceRecoversPersistedRow(t *testing.T) {
-	pool := testPool(t)
+	pool := isolatedTestPool(t)
 	firstRepo := database.NewWalletRepo(pool)
 	playerID, walletID := createTestWallet(t, firstRepo, pool, "100.00")
 	amount := testMoney(t, "25.00")
@@ -1194,4 +1181,65 @@ func testRequest(
 		Kind:                  "BET",
 		Amount:                amount,
 	}
+}
+
+func TestReversalOfRejectedReferenceIsRejectedWithoutWaiting(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, repo, pool, "10.00")
+	bet := testRequest(playerID, walletID, "rejected-reference-bet", "rejected-reference-bet-key", "rejected-reference-bet-hash", testMoney(t, "25.00"))
+	betResult, err := repo.ProcessTransaction(context.Background(), bet)
+	if err != nil || betResult.Status != "REJECTED" || betResult.FailureCode != "insufficient_funds" {
+		t.Fatalf("expected rejected bet, got %+v/%v", betResult, err)
+	}
+
+	for _, kind := range []string{"REFUND", "ROLLBACK"} {
+		reversal := testRequest(playerID, walletID, "rejected-reference-"+kind, "rejected-reference-"+kind+"-key", "rejected-reference-"+kind+"-hash", testMoney(t, "25.00"))
+		reversal.Kind = kind
+		reversal.ReferenceExternalTransactionID = bet.ExternalTransactionID
+		result, err := repo.ProcessTransaction(context.Background(), reversal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Status != "REJECTED" || result.FailureCode != "reference_incompatible" {
+			t.Fatalf("%s of a rejected bet: expected reference_incompatible rejection, got %s/%s", kind, result.Status, result.FailureCode)
+		}
+	}
+
+	var balanceCents, ledgerCount int
+	if err := pool.QueryRow(context.Background(), `SELECT balance_cents FROM wallets WHERE id = $1`, walletID).Scan(&balanceCents); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID).Scan(&ledgerCount); err != nil {
+		t.Fatal(err)
+	}
+	if balanceCents != 1000 || ledgerCount != 1 {
+		t.Fatalf("reversal of a rejected bet changed financial state: balance=%d ledger=%d", balanceCents, ledgerCount)
+	}
+}
+
+// isolatedTestPool returns a pool bound to a fresh schema with every migration
+// applied. Tests that claim pending references globally use it so they neither
+// see nor reschedule rows from other tests or from a running stack.
+func isolatedTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	base := testPool(t)
+	ctx := context.Background()
+	schema := "reference_test_" + strings.ReplaceAll(uuid.NewString()[:8], "-", "")
+	if _, err := base.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = base.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`) })
+
+	poolConfig := base.Config().Copy()
+	poolConfig.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := migrations.Run(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	return pool
 }

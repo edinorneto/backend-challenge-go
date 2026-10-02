@@ -1102,7 +1102,7 @@ func (r *WalletRepo) retryPendingReferenceTx(ctx context.Context, tx pgx.Tx, tra
 		if err := domainTransaction.MarkPendingReference(time.Now().UTC()); err != nil {
 			return ports.ProcessTransactionResult{}, err
 		}
-		result, err := persistReferenceRetry(ctx, tx, transactionID, reversalReq, req.attempts, req.balanceCents, req.currency)
+		result, err := persistReferenceRetry(ctx, tx, transactionID, reversalReq, req.attempts)
 		if err != nil {
 			return ports.ProcessTransactionResult{}, err
 		}
@@ -1577,60 +1577,68 @@ func insertLedgerEntry(ctx context.Context, tx pgx.Tx, entry *ledger.WalletLedge
 	return nil
 }
 
+// persistReferenceRetry records a retry whose reference is still unavailable.
+// The WagerTransactionPendingReference event is emitted only when the wait is
+// registered, so retries only advance the persisted backoff. When the attempts
+// are exhausted, the rejection stores the wallet balance and version observed at
+// that moment, which idempotent replays return like any other rejection.
 func persistReferenceRetry(
 	ctx context.Context,
 	tx pgx.Tx,
 	transactionID uuid.UUID,
 	req ports.ProcessTransactionRequest,
 	currentAttempts int,
-	balanceCents int64,
-	currency string,
 ) (ports.ProcessTransactionResult, error) {
 	now := time.Now().UTC()
 	attempts := currentAttempts + 1
-	status := "PENDING_REFERENCE"
-	failureCode := failureReferencePending
-	if attempts > maxReferenceAttempts {
-		status = "REJECTED"
-		failureCode = failureReferenceNotFound
-	}
 	nextAttempt := nextReferenceAttempt(now, attempts)
-	if _, err := tx.Exec(ctx, `
-		UPDATE wager_transactions
-		SET status = $1, failure_code = $2, reference_attempts = $3,
-		    reference_next_attempt_at = $4, updated_at = $5, processed_at = NULL
-		WHERE id = $6
-	`, status, failureCode, attempts, nextAttempt, now, transactionID); err != nil {
-		return ports.ProcessTransactionResult{}, fmt.Errorf("update reference retry: %w", err)
+	zero, err := money.Zero(req.Amount.Currency())
+	if err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("create pending reference balance: %w", err)
+	}
+
+	if attempts <= maxReferenceAttempts {
+		if _, err := tx.Exec(ctx, `
+			UPDATE wager_transactions
+			SET reference_attempts = $1, reference_next_attempt_at = $2, updated_at = $3
+			WHERE id = $4
+		`, attempts, nextAttempt, now, transactionID); err != nil {
+			return ports.ProcessTransactionResult{}, fmt.Errorf("update reference retry: %w", err)
+		}
+		return ports.ProcessTransactionResult{
+			TransactionID: transactionID, Status: "PENDING_REFERENCE", Balance: zero, FailureCode: failureReferencePending,
+		}, nil
+	}
+
+	var balanceCents, walletVersion int64
+	var currency string
+	if err := tx.QueryRow(ctx, `SELECT balance_cents, version, currency FROM wallets WHERE id = $1`, req.WalletID).
+		Scan(&balanceCents, &walletVersion, &currency); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ports.ProcessTransactionResult{}, ErrWalletNotFound
+		}
+		return ports.ProcessTransactionResult{}, fmt.Errorf("read wallet for expired reference: %w", err)
 	}
 	balance, err := money.FromCents(balanceCents, currency)
 	if err != nil {
-		return ports.ProcessTransactionResult{}, fmt.Errorf("rehydrate reference retry balance: %w", err)
+		return ports.ProcessTransactionResult{}, fmt.Errorf("rehydrate expired reference balance: %w", err)
 	}
-	var event messaging.Event
-	if status == "REJECTED" {
-		rejected := buildRejectedPayload(transactionID, req, failureCode, balance, 0)
-		rejected.ReferenceAttempts = attempts
-		rejected.NextAttemptAt = nextAttempt.UTC().Format(time.RFC3339)
-		event = messaging.NewWagerTransactionRejected(rejected)
-	} else {
-		event = messaging.NewWagerTransactionPendingReference(messaging.WagerTransactionPendingReferenceData{
-			TransactionID:                  transactionID,
-			WalletID:                       req.WalletID,
-			ProviderID:                     req.ProviderID,
-			Kind:                           req.Kind,
-			Status:                         status,
-			FailureCode:                    failureCode,
-			ReferenceExternalTransactionID: req.ReferenceExternalTransactionID,
-			ReferenceAttempts:              attempts,
-			NextAttemptAt:                  nextAttempt.UTC().Format(time.RFC3339),
-		})
+	if _, err := tx.Exec(ctx, `
+		UPDATE wager_transactions
+		SET status = 'REJECTED', failure_code = $1, reference_attempts = $2,
+		    reference_next_attempt_at = NULL, result_balance_cents = $3,
+		    result_wallet_version = $4, updated_at = $5, processed_at = NULL
+		WHERE id = $6
+	`, failureReferenceNotFound, attempts, balanceCents, walletVersion, now, transactionID); err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("reject expired reference: %w", err)
 	}
-	if err := insertOutboxEvent(ctx, tx, now, transactionID, event); err != nil {
-		return ports.ProcessTransactionResult{}, fmt.Errorf("insert reference retry event: %w", err)
+	rejected := buildRejectedPayload(transactionID, req, failureReferenceNotFound, balance, walletVersion)
+	rejected.ReferenceAttempts = attempts
+	if err := insertOutboxEvent(ctx, tx, now, transactionID, messaging.NewWagerTransactionRejected(rejected)); err != nil {
+		return ports.ProcessTransactionResult{}, fmt.Errorf("insert expired reference rejection event: %w", err)
 	}
 	return ports.ProcessTransactionResult{
-		TransactionID: transactionID, Status: status, Balance: balance, FailureCode: failureCode,
+		TransactionID: transactionID, Status: "REJECTED", Balance: balance, FailureCode: failureReferenceNotFound,
 	}, nil
 }
 

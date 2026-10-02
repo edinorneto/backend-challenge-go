@@ -2,11 +2,13 @@ package application
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/edinorneto/backend-challenge-go/internal/config"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 )
 
 type fakePendingReferenceRepository struct {
@@ -100,5 +102,57 @@ func TestReferenceWorkerOutlivesStartupContext(t *testing.T) {
 
 	if err := worker.Stop(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type failingPendingReferenceRepository struct {
+	calls chan struct{}
+}
+
+func (r *failingPendingReferenceRepository) ProcessNextPendingReference(context.Context) (bool, error) {
+	select {
+	case r.calls <- struct{}{}:
+	default:
+	}
+	return false, errors.New("transient database error")
+}
+
+func TestReferenceWorkerRecordsOwnMetrics(t *testing.T) {
+	metrics := observability.NewMetrics()
+	repo := &fakePendingReferenceRepository{ready: make(chan struct{})}
+	worker := NewReferenceWorker(repo, config.Config{ReferencePollInterval: time.Millisecond}, metrics)
+	if err := worker.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-repo.ready:
+	case <-time.After(time.Second):
+		t.Fatal("reference worker did not process the pending reference")
+	}
+	if err := worker.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := metrics.Snapshot("reference_worker_processed_total"); got != 1 {
+		t.Fatalf("expected one processed pending reference, got %d", got)
+	}
+	if got := metrics.Snapshot("reconciliation_processed_total"); got != 0 {
+		t.Fatalf("reference processing must not count as reconciliation, got %d", got)
+	}
+
+	failing := &failingPendingReferenceRepository{calls: make(chan struct{}, 1)}
+	worker = NewReferenceWorker(failing, config.Config{ReferencePollInterval: time.Millisecond}, metrics)
+	if err := worker.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-failing.calls:
+	case <-time.After(time.Second):
+		t.Fatal("reference worker did not poll")
+	}
+	if err := worker.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := metrics.Snapshot("reference_worker_failures_total"); got < 1 {
+		t.Fatalf("expected the failure to be counted, got %d", got)
 	}
 }
