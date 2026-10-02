@@ -371,3 +371,21 @@ func TestMiddlewareFillsIdentityRecorder(t *testing.T) {
 		t.Fatal("a context without a recorder has no recorded identity")
 	}
 }
+
+// An empty OIDC_AUDIENCE does not disable the audience check: go-oidc requires a
+// client ID unless SkipClientIDCheck is set, so every token is refused.
+func TestVerifierWithoutAudienceRejectsEveryToken(t *testing.T) {
+	server := newOIDCTestServer(t)
+	verifier, err := NewVerifier(config.Config{
+		OIDCIssuerURL:     server.server.URL,
+		OIDCJWKSURL:       server.server.URL + "/keys",
+		OIDCProviderClaim: "provider_id",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := server.token(t, "provider-a", time.Now().Add(time.Hour), server.server.URL, server.key)
+	if _, err := verifier.Verify(context.Background(), token); err == nil {
+		t.Fatal("expected an empty audience configuration to refuse a valid token")
+	}
+}

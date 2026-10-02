@@ -62,7 +62,7 @@ the Compose network.
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | empty | SQS credentials (`test` / `test` for LocalStack) |
 | `OIDC_ISSUER_URL` | `http://localhost:8081/realms/backend` | Expected token issuer (the public Keycloak URL) |
 | `OIDC_JWKS_URL` | `http://localhost:8081/realms/backend/protocol/openid-connect/certs` | Signing keys; `http://keycloak:8080/...` inside Compose |
-| `OIDC_AUDIENCE` | empty | Required audience (`backend-api` in Compose). **When empty, the audience is not checked.** Always set it outside local development |
+| `OIDC_AUDIENCE` | empty | Required audience (`backend-api` in Compose). **Must be set: when empty, every token is refused (`401`).** |
 | `OIDC_PROVIDER_CLAIM` | `provider_id` | Token claim holding the provider identity |
 | `SQS_TRANSACTION_QUEUE` | `wager-transactions.fifo` | Command queue |
 | `SQS_TRANSACTION_DLQ` | `wager-transactions-dlq.fifo` | Dead-letter queue of the command queue |
@@ -156,7 +156,7 @@ Errors use `{"error":"<code>"}` with `Content-Type: application/json`.
 | Operation processed (also `LOSS`) | `200` | `status: PROCESSED`, `balance`, `transactionId`, `idempotentReplay` |
 | Wallet opened | `201` | wallet with `id`, `balance`, `version: 1` |
 | Waiting for the reference of a reversal | `202` | `status: PENDING_REFERENCE`, `failureCode: reference_pending`, no balance |
-| Malformed or invalid input (nothing is stored) | `400` | `invalid_json`, `idempotency_key_required`, `invalid_player_id`, `invalid_wallet_id`, `invalid_money`, `invalid_request` (unknown kind, `OPENING`, missing reference), `invalid_limit`, `invalid_cursor`, `invalid_transaction_id` |
+| Malformed or invalid input (nothing is stored) | `400` | `invalid_json`, `idempotency_key_required`, `invalid_player_id`, `invalid_wallet_id`, `invalid_money`, `invalid_request` (unknown kind, `OPENING`, missing reference, amount outside the kind's rule), `invalid_limit`, `invalid_cursor`, `invalid_transaction_id` |
 | Missing, invalid or expired token | `401` | `authentication_required`, `invalid_token` |
 | Wrong role, other provider's data, body provider differs from token | `403` | `forbidden`, `provider_access_denied`, `provider_mismatch` |
 | Unknown wallet or transaction | `404` | `wallet_not_found`, `transaction_not_found` |

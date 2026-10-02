@@ -215,11 +215,14 @@ input, the provider sends a new operation with a new external ID and key.
 | `reference_incompatible` | the reference differs (provider, player, wallet, round, currency, amount), has a kind that cannot be reversed this way, or ended `REJECTED`/`FAILED` | correctable input |
 | `currency_mismatch` | the operation's currency is not the wallet's | correctable input |
 | `wallet_player_mismatch` | the wallet belongs to another player | correctable input |
-| `unsupported_operation` | the amount breaks the kind's rule (`BET`/`WIN` not positive, `LOSS` not zero) | correctable input |
 
 `reference_pending` is not a rejection; it accompanies the `PENDING_REFERENCE`
 status. Malformed requests (`400`) and conflicts (`409`) are never stored, so the
-same key can be used again with a valid payload.
+same key can be used again with a valid payload. An amount that breaks the
+kind's rule (`BET`, `WIN`, `REFUND` or `ROLLBACK` not positive, `LOSS` not
+zero) is malformed input: `WageringService` refuses it before anything is
+stored, as `400 invalid_request` on HTTP and as an `invalid_message` failure on
+SQS (the message reaches the DLQ). It is not a stored `422` rejection.
 
 ## 5. Idempotency
 
@@ -721,8 +724,10 @@ apply again, and the data is kept and the later protections come back.
   if replayed with the same key. Only test data existed.
 - **Fixed policies.** The reference retry policy (1 min base, 5 retries), the
   poll intervals and the consumer settings are constants, not environment
-  variables. `OIDC_AUDIENCE` is optional and, when empty, the audience is not
-  checked (Compose sets it).
+  variables. `OIDC_AUDIENCE` must be set (Compose sets `backend-api`): when it
+  is empty, go-oidc has no client ID to check and refuses every token, so all
+  protected routes answer `401`
+  (`TestVerifierWithoutAudienceRejectsEveryToken`).
 - **Metrics** are per process and `/metrics` is public in Compose.
   `wallet_lock_contended_total` uses a 5 ms threshold as an approximation.
 - **Reference worker.** A pending row whose processing failed permanently (only
