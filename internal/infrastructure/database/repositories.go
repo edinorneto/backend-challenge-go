@@ -606,9 +606,13 @@ func (r *WalletRepo) ProcessTransaction(
 		updatedAt    time.Time
 	}{}
 
+	// FOR NO KEY UPDATE serializes writers of this wallet like FOR UPDATE, but does
+	// not conflict with the FOR KEY SHARE lock that the wager_transactions insert
+	// above (foreign key to wallets) already holds in concurrent transactions.
+	// FOR UPDATE would make two concurrent operations on the same wallet deadlock.
 	err = tx.QueryRow(
 		ctx,
-		`SELECT player_id, currency, balance_cents, version, created_at, updated_at FROM wallets WHERE id = $1 FOR UPDATE`,
+		`SELECT player_id, currency, balance_cents, version, created_at, updated_at FROM wallets WHERE id = $1 FOR NO KEY UPDATE`,
 		req.WalletID,
 	).Scan(
 		&walletRow.playerID,
@@ -1119,7 +1123,7 @@ func (r *WalletRepo) retryPendingReferenceTx(ctx context.Context, tx pgx.Tx, tra
 	}{}
 	if err := tx.QueryRow(ctx, `
 		SELECT player_id, currency, balance_cents, version, created_at, updated_at
-		FROM wallets WHERE id = $1 FOR UPDATE
+		FROM wallets WHERE id = $1 FOR NO KEY UPDATE
 	`, req.walletID).Scan(
 		&walletRow.playerID, &walletRow.currency, &walletRow.balanceCents,
 		&walletRow.version, &walletRow.createdAt, &walletRow.updatedAt,

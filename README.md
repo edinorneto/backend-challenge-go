@@ -135,6 +135,25 @@ go vet ./...
 Integration tests use the real PostgreSQL, Keycloak and LocalStack services when
 run with `-tags=integration`.
 
+End-to-end tests (`test/e2e`, tag `e2e`) drive the running Compose stack through
+Nginx, Keycloak tokens and the real SQS command queue, with the three replicas.
+They cover:
+
+- 50 identical bets in parallel;
+- two 80.00 bets on 100.00;
+- independent wallets in parallel;
+- the same operation through HTTP and SQS;
+- SIGKILL and SIGTERM of replicas during SQS load;
+- a restart of every replica.
+
+They use the `docker` CLI to stop replicas and restore the stack at the end, and
+take about 80 seconds, mostly the SQS visibility timeout after a SIGKILL:
+
+```powershell
+docker compose up -d --build --wait
+go test -tags=e2e -count=1 -v ./test/e2e/
+```
+
 ## Observability
 
 The API emits one JSON log entry per HTTP request and structured JSON entries

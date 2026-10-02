@@ -35,8 +35,11 @@ type QueueConsumer struct {
 	logger    *observability.Logger
 	metrics   *observability.Metrics
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// cancel stops polling; abort cancels the in-flight work when the stop
+	// deadline expires.
 	cancel context.CancelFunc
+	abort  context.CancelFunc
 	wg     sync.WaitGroup
 }
 
@@ -72,11 +75,13 @@ func (c *QueueConsumer) Start(ctx context.Context) error {
 		c.mu.Unlock()
 		return nil
 	}
-	child, cancel := context.WithCancel(ctx)
+	pollCtx, cancel := context.WithCancel(ctx)
+	workCtx, abort := context.WithCancel(context.WithoutCancel(ctx))
 	c.cancel = cancel
+	c.abort = abort
 	c.mu.Unlock()
 	c.wg.Add(1)
-	go c.loop(child)
+	go c.loop(pollCtx, workCtx)
 	return nil
 }
 
@@ -85,12 +90,15 @@ func (c *QueueConsumer) Stop(ctx context.Context) error {
 		return nil
 	}
 	c.mu.Lock()
-	cancel := c.cancel
-	c.cancel = nil
+	cancel, abort := c.cancel, c.abort
+	c.cancel, c.abort = nil, nil
 	c.mu.Unlock()
 	if cancel == nil {
 		return nil
 	}
+	// Stop polling first and let the batch already received finish within the
+	// deadline. If the deadline expires, abort that work: its transactions roll
+	// back and the unfinished messages are released for immediate redelivery.
 	cancel()
 	done := make(chan struct{})
 	go func() {
@@ -99,13 +107,19 @@ func (c *QueueConsumer) Stop(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		abort()
 		return nil
 	case <-ctx.Done():
+		abort()
+		select {
+		case <-done:
+		case <-time.After(releaseTimeout):
+		}
 		return ctx.Err()
 	}
 }
 
-func (c *QueueConsumer) loop(ctx context.Context) {
+func (c *QueueConsumer) loop(ctx, workCtx context.Context) {
 	defer c.wg.Done()
 	batchSize := c.cfg.BatchSize
 	if batchSize <= 0 {
@@ -143,7 +157,7 @@ func (c *QueueConsumer) loop(ctx context.Context) {
 			}
 			continue
 		}
-		if err := c.processBatch(ctx, messages); err != nil {
+		if err := c.processBatch(workCtx, messages); err != nil {
 			if c.logger != nil {
 				c.logger.Error(ctx, "consumer_batch_failed", err, nil)
 			} else {
@@ -169,8 +183,13 @@ func (c *QueueConsumer) processBatch(ctx context.Context, messages []ports.Queue
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for _, message := range group {
+			for index, message := range group {
 				if err := c.processMessage(ctx, message); err != nil {
+					if ctx.Err() != nil {
+						c.releaseVisibility(group[index:])
+						errCh <- err
+						return
+					}
 					c.scheduleRetry(ctx, message, err)
 					errCh <- err
 					return
@@ -356,5 +375,36 @@ func wait(ctx context.Context, delay time.Duration) bool {
 		return false
 	case <-timer.C:
 		return true
+	}
+}
+
+// releaseTimeout bounds the work done after an aborted stop: waiting for the
+// aborted batch to unwind and releasing the visibility of its messages.
+const releaseTimeout = 2 * time.Second
+
+// releaseVisibility makes messages that were received but not completed visible
+// again at once, so another consumer can take them without waiting for the
+// visibility timeout. It runs after the work context was cancelled, so it uses
+// its own short deadline.
+func (c *QueueConsumer) releaseVisibility(messages []ports.QueueMessage) {
+	changer, ok := c.receiver.(ports.QueueVisibilityChanger)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
+	defer cancel()
+	for _, message := range messages {
+		if err := changer.ChangeVisibility(ctx, message.ReceiptHandle, 0); err != nil {
+			if c.logger != nil {
+				c.logger.Error(ctx, "consumer_release_failed", err, map[string]string{"messageId": message.MessageID})
+			}
+			continue
+		}
+		if c.metrics != nil {
+			c.metrics.Inc("sqs_messages_released_total")
+		}
+		if c.logger != nil {
+			c.logger.Info(ctx, "consumer_message_released", map[string]string{"messageId": message.MessageID})
+		}
 	}
 }

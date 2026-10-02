@@ -3,6 +3,7 @@ package database_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -349,6 +350,82 @@ func TestProcessTransactionConcurrentBetsLockOneWallet(t *testing.T) {
 	}
 	if balanceCents != 2000 {
 		t.Fatalf("expected final balance 20.00, got %d cents", balanceCents)
+	}
+	var debits int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM wallet_ledger_entries WHERE wallet_id = $1 AND direction = 'DEBIT'`, walletID).Scan(&debits); err != nil {
+		t.Fatal(err)
+	}
+	if debits != 1 {
+		t.Fatalf("expected a single debit in the ledger, got %d", debits)
+	}
+
+	// Resending both bets replays the original outcomes without changing anything.
+	for index, request := range requests {
+		replay, err := repo.ProcessTransaction(context.Background(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !replay.IdempotentReplay || replay.TransactionID != results[index].TransactionID ||
+			replay.Status != results[index].Status || replay.FailureCode != results[index].FailureCode ||
+			replay.Balance.String() != results[index].Balance.String() {
+			t.Fatalf("resend %d changed the outcome: original %+v, replay %+v", index, results[index], replay)
+		}
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT balance_cents FROM wallets WHERE id = $1`, walletID).Scan(&balanceCents); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM wallet_ledger_entries WHERE wallet_id = $1 AND direction = 'DEBIT'`, walletID).Scan(&debits); err != nil {
+		t.Fatal(err)
+	}
+	if balanceCents != 2000 || debits != 1 {
+		t.Fatalf("resends changed the wallet: balance=%d debits=%d", balanceCents, debits)
+	}
+	assertStoredBalanceMatchesLedger(t, pool, walletID)
+}
+
+// Wallet coordination is a row lock on that wallet only: while one wallet is
+// locked by an open transaction, an operation on another wallet must complete.
+func TestProcessTransactionDifferentWalletsDoNotWaitForEachOther(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	_, lockedWalletID := createTestWallet(t, repo, pool, "100.00")
+	playerID, freeWalletID := createTestWallet(t, repo, pool, "100.00")
+
+	ctx := context.Background()
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx)
+	if _, err := holder.Exec(ctx, `SELECT id FROM wallets WHERE id = $1 FOR UPDATE`, lockedWalletID); err != nil {
+		t.Fatal(err)
+	}
+
+	opCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	request := testRequest(playerID, freeWalletID, "parallel-free-wallet", "parallel-free-wallet-key", "parallel-free-wallet-hash", testMoney(t, "25.00"))
+	result, err := repo.ProcessTransaction(opCtx, request)
+	if err != nil {
+		t.Fatalf("operation on another wallet waited for the locked wallet: %v", err)
+	}
+	if result.Status != "PROCESSED" || result.Balance.String() != "75.00" {
+		t.Fatalf("expected the free wallet to be debited, got %+v", result)
+	}
+}
+
+func assertStoredBalanceMatchesLedger(t *testing.T, pool *pgxpool.Pool, walletID uuid.UUID) {
+	t.Helper()
+	var stored, calculated int64
+	if err := pool.QueryRow(context.Background(), `
+		SELECT w.balance_cents,
+		       COALESCE(SUM(CASE l.direction WHEN 'CREDIT' THEN l.amount_cents ELSE -l.amount_cents END), 0)
+		FROM wallets w LEFT JOIN wallet_ledger_entries l ON l.wallet_id = w.id
+		WHERE w.id = $1 GROUP BY w.balance_cents
+	`, walletID).Scan(&stored, &calculated); err != nil {
+		t.Fatal(err)
+	}
+	if stored != calculated {
+		t.Fatalf("stored balance %d differs from ledger credits minus debits %d", stored, calculated)
 	}
 }
 
@@ -1242,4 +1319,43 @@ func isolatedTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatal(err)
 	}
 	return pool
+}
+
+// Concurrent operations on one wallet both insert a wager transaction (taking
+// FOR KEY SHARE on the wallet through the foreign key) before locking the wallet.
+// The wallet lock must not conflict with that, or the pair deadlocks and one
+// request fails. Many rounds make the interleaving very likely.
+func TestProcessTransactionConcurrentBetsDoNotDeadlock(t *testing.T) {
+	pool := testPool(t)
+	repo := database.NewWalletRepo(pool)
+	for round := 0; round < 40; round++ {
+		playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+		requests := []ports.ProcessTransactionRequest{
+			testRequest(playerID, walletID, fmt.Sprintf("deadlock-a-%d", round), fmt.Sprintf("deadlock-a-key-%d", round), "deadlock-a-hash", testMoney(t, "80.00")),
+			testRequest(playerID, walletID, fmt.Sprintf("deadlock-b-%d", round), fmt.Sprintf("deadlock-b-key-%d", round), "deadlock-b-hash", testMoney(t, "80.00")),
+		}
+		errs := make([]error, len(requests))
+		statuses := make([]string, len(requests))
+		start := make(chan struct{})
+		var group sync.WaitGroup
+		for index := range requests {
+			group.Add(1)
+			go func(index int) {
+				defer group.Done()
+				<-start
+				result, err := repo.ProcessTransaction(context.Background(), requests[index])
+				errs[index], statuses[index] = err, result.Status
+			}(index)
+		}
+		close(start)
+		group.Wait()
+		for index, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d request %d failed: %v", round, index, err)
+			}
+		}
+		if !(statuses[0] == "PROCESSED" && statuses[1] == "REJECTED") && !(statuses[0] == "REJECTED" && statuses[1] == "PROCESSED") {
+			t.Fatalf("round %d: expected one processed and one rejected bet, got %v", round, statuses)
+		}
+	}
 }

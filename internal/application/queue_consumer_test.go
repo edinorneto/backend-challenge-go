@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -432,5 +433,99 @@ func TestQueueConsumerRetriesTransientReceiveError(t *testing.T) {
 	cancel()
 	if err := consumer.Stop(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func batchOfThree() []ports.QueueMessage {
+	messages := make([]ports.QueueMessage, 3)
+	for i := range messages {
+		messages[i] = ports.QueueMessage{
+			MessageID:     fmt.Sprintf("stop-%d", i),
+			ReceiptHandle: fmt.Sprintf("receipt-%d", i),
+			MessageGroup:  "wallet-1",
+			Body:          validBody(),
+		}
+	}
+	return messages
+}
+
+// On SIGTERM the consumer stops polling but completes the batch it already
+// received, as long as the stop deadline allows.
+func TestQueueConsumerStopCompletesReceivedBatch(t *testing.T) {
+	receiver := &fakeQueueReceiver{messages: batchOfThree()}
+	started := make(chan struct{})
+	proceed := make(chan struct{})
+	var once sync.Once
+	consumer := NewQueueConsumer(receiver, &fakeInboxRepository{}, func(ctx context.Context, _ []byte) error {
+		once.Do(func() { close(started) })
+		select {
+		case <-proceed:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}, QueueConsumerConfig{Name: "stop-test", WaitTimeSeconds: 1})
+	if err := consumer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stopped <- consumer.Stop(ctx)
+	}()
+	select {
+	case err := <-stopped:
+		t.Fatalf("Stop returned while a received message was still being processed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(proceed)
+	if err := <-stopped; err != nil {
+		t.Fatalf("Stop must succeed once the batch completes: %v", err)
+	}
+
+	receiver.mu.Lock()
+	defer receiver.mu.Unlock()
+	if len(receiver.deleted) != 3 || len(receiver.visibility) != 0 {
+		t.Fatalf("expected the whole received batch to complete and be deleted, deleted=%v visibility=%v", receiver.deleted, receiver.visibility)
+	}
+}
+
+// If the stop deadline expires, the in-flight work is cancelled and every
+// message that did not complete becomes visible again at once.
+func TestQueueConsumerStopDeadlineReleasesUnfinishedMessages(t *testing.T) {
+	receiver := &fakeQueueReceiver{messages: batchOfThree()}
+	started := make(chan struct{})
+	var once sync.Once
+	consumer := NewQueueConsumer(receiver, &fakeInboxRepository{}, func(ctx context.Context, _ []byte) error {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		return ctx.Err()
+	}, QueueConsumerConfig{Name: "stop-deadline-test", WaitTimeSeconds: 1})
+	if err := consumer.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := consumer.Stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected the stop deadline to be reported, got %v", err)
+	}
+
+	receiver.mu.Lock()
+	defer receiver.mu.Unlock()
+	if len(receiver.deleted) != 0 {
+		t.Fatalf("aborted messages must not be deleted, got %v", receiver.deleted)
+	}
+	if len(receiver.visibility) != 3 {
+		t.Fatalf("expected the three unfinished messages to be released, got %v", receiver.visibility)
+	}
+	for _, seconds := range receiver.visibility {
+		if seconds != 0 {
+			t.Fatalf("released messages must be visible immediately, got visibility %v", receiver.visibility)
+		}
 	}
 }

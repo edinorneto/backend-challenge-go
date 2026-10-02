@@ -198,10 +198,32 @@ Retry and DLQ-eligibility counters are observations only. In particular,
 `sqs_messages_dlq_eligible_total` does not delete or quarantine a message and
 does not replace the queue's redrive decision.
 
-On SIGTERM, lifecycle cancellation stops polling and waits for the consumer
-goroutine. A message in flight without a completed delete becomes visible
-again and is redelivered; a message whose database transaction committed is
-protected by the Inbox and will not apply the financial effect twice.
+A command that reuses an idempotency key with a different payload (or an
+external ID with another key) is a permanent input error, not a business
+rejection: it has no financial effect, stays undeleted, and reaches the DLQ
+once the receive limit is exhausted. The same happens to valid commands if
+PostgreSQL stays unavailable through all their attempts (5 receives by default,
+retried 1 to 30 s apart). Such messages are not lost: they wait in the DLQ and
+can be moved back to the command queue once the cause is fixed, and the Inbox
+and idempotency keys make that replay safe.
+
+On SIGTERM the consumer uses two contexts. The polling context is cancelled at
+once, so no new message is received. The batch already received (at most 10
+messages) is completed with a separate work context, so its transactions commit
+and its messages are deleted before the process exits. Only if the Fx stop
+deadline expires is that work context cancelled: the open transactions roll
+back and every message that did not complete has its visibility set to 0, so
+another replica receives it immediately instead of after the visibility
+timeout. A replica that dies without running this (SIGKILL, crash) leaves its
+received messages invisible until the visibility timeout (30 s). They are then
+redelivered: if the transaction had committed, the Inbox stops the duplicate;
+otherwise the survivor applies it.
+
+A related at-least-once effect: when a replica stops in the middle of a 20 s
+long poll, LocalStack can still hand a newly arriving message to that
+closed request. The message then becomes visible again only after the
+visibility timeout, so a command sent right after replicas are replaced can take
+about 30 s to be processed. It is still processed exactly once.
 
 The application also runs a pending-reference worker for
 `PENDING_REFERENCE`. It polls due rows from `wager_transactions`, claims one
@@ -259,6 +281,58 @@ not use SQL offsets. Reconciliation runs in a read transaction, sums credits
 and debits including the opening entry, reports the difference from the stored
 wallet balance, and never mutates the wallet or ledger.
 
+### Concurrency and wallet locking
+
+Coordination is per wallet, with pessimistic row locks inside the operation's
+transaction; there is no global or in-process lock. An operation:
+
+1. inserts its `wager_transactions` row (`ON CONFLICT DO NOTHING` on the
+   idempotency and external-ID unique indexes, which makes duplicates of one
+   operation wait for and then replay the first one);
+2. for reversals, locks the referenced transaction row (`FOR UPDATE`);
+3. locks the wallet row with `SELECT ... FOR NO KEY UPDATE`, applies the domain
+   debit or credit, updates balance and version, inserts the ledger entry and
+   the outbox events, and commits.
+
+The pending-reference worker takes the same order (reference, then wallet). The
+wallet lock is `FOR NO KEY UPDATE`, not `FOR UPDATE`. It is exclusive between
+writers, so two operations on one wallet run one after the other and no update
+is lost. But it does not conflict with the `FOR KEY SHARE` lock that step 1
+takes on the wallet through the foreign key. With `FOR UPDATE`, two concurrent
+operations on the same wallet deadlocked: each held `KEY SHARE` from its insert
+and waited for the other's to upgrade to `FOR UPDATE`. PostgreSQL aborted one of
+them, and the client got a `503`. The E2E 80+80 test found this; the regression
+test `TestProcessTransactionConcurrentBetsDoNotDeadlock` fails with SQLSTATE
+`40P01` on the old lock and passes on the new one.
+
+Balance non-negativity, ledger uniqueness and immutability do not depend on
+these locks: they are database constraints and triggers.
+`TestProcessTransactionDifferentWalletsDoNotWaitForEachOther` holds one wallet
+locked and shows that an operation on another wallet completes meanwhile.
+
+### Verification of concurrency and failure scenarios
+
+| Scenario | Evidence |
+| --- | --- |
+| Same bet 50 times in parallel | `TestProcessTransactionFiftyConcurrentDuplicateBets`; E2E `TestE2EFiftyParallelIdenticalBets` through Nginx and three replicas: one debit, 49 replays |
+| Two 80.00 bets on 100.00 | `TestProcessTransactionConcurrentBetsLockOneWallet` (plus resends); E2E `TestE2EConcurrentOverdraftBets`: one processed, one `insufficient_funds` (422), balance 20.00, one debit, resends unchanged |
+| Different wallets in parallel | `TestProcessTransactionDifferentWalletsDoNotWaitForEachOther`; E2E `TestE2EIndependentWalletsInParallel` |
+| Three independent processes | The E2E suite runs against three Compose replicas |
+| Consumer stops after commit, before delete | `TestFinancialQueueConsumerRecoveryAfterCommit`; E2E `TestE2EInstanceFailuresDuringSQSLoad` freezes a replica holding an undeleted message and kills it with SIGKILL. Across runs it caught interruptions both after the commit (the Inbox stopped the redelivery) and before it (a survivor applied it) |
+| SIGTERM during load | Same E2E test: the stopped replica leaves no received message unfinished; unit tests cover completing the batch and releasing visibility at the deadline |
+| Repeated delivery | `TestFinancialQueueConsumerAppliesRepeatedDeliveryOnce`: two real SQS deliveries of one `messageId`, one effect, Inbox duplicate counted |
+| Same operation via HTTP and SQS | E2E `TestE2ESameOperationThroughHTTPAndSQS`: concurrent HTTP and SQS plus a later SQS copy with another `messageId`, no conflict (same payload hash on both channels), one debit |
+| Conflicting payload via SQS | `TestFinancialQueueConsumerSendsIdempotencyConflictToDLQ` |
+| Two publishers, publish then crash before mark | `TestTwoOutboxPublishersPublishConcurrentEventsOnce`, `TestOutboxPublisherRecoversAfterPublishBeforeMarkPublished` (same `eventId` on republication) |
+| Reversal before its reference, expiry | `TestReferenceWorkersResolveReversalRegisteredByStoppedInstance`, `TestReferenceWorkerRejectsExpiredReferenceWithObservedBalance` |
+| Restart | E2E `TestE2ERestartPreservesIdempotency`: after restarting every replica, replays return the original result and a pending reference is still pending |
+| Ledger vs stored balance | Every E2E wallet is checked through `POST /wallets/{id}/reconciliation` |
+
+Operations are always accepted synchronously, without an intermediate `PENDING`
+commit (`PENDING` exists only inside the transaction), so there is no committed
+`PENDING` to resume. The durable pending state is `PENDING_REFERENCE`, which the
+reference worker resumes on any replica.
+
 ### Multiple instances
 
 Compose runs three application replicas by default (`deploy.replicas: 3`). Each
@@ -268,9 +342,20 @@ and SQS. No component relies on in-process state for correctness: idempotency,
 pending references and outbox claims are rows, wallet coordination uses row
 locks, and each outbox publisher has a random owner token. An Nginx reverse
 proxy provides the single external HTTP endpoint. It re-resolves the Docker DNS
-name every 5 seconds, so scaled or restarted replicas receive traffic.
-Non-idempotent requests are not retried on another upstream after being sent
-(Nginx default).
+name every 2 seconds, so scaled or restarted replicas receive traffic.
+
+When a replica dies, its address stays in Nginx until the next DNS refresh, and
+`connect()` to it only failed after about 38 seconds (measured), returning 502.
+Nginx therefore uses a 1-second connect timeout and passes the request to
+another replica on connection errors and timeouts (`proxy_next_upstream error
+timeout`, up to 3 tries). With that, a request that hits a dead replica answered
+`200` in about 1 second. For `POST`, Nginx does not resend a request after a
+timeout (`non_idempotent` is deliberately not enabled, because a read timeout
+would resend a request that may have been processed). So a `POST` can still get
+`502`/`504` in that short window. Clients treat `502`, `503` and `504` as
+transient and retry the same request. Every `POST` of the API is safe to retry:
+wagering through its `Idempotency-Key`, reconciliation is read-only, and opening
+a wallet that already exists answers `409`. The E2E client does exactly this.
 
 Verified with a clean Compose project:
 

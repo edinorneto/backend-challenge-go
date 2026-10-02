@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"sync"
 	"testing"
@@ -287,11 +288,14 @@ func TestFinancialQueueConsumerRecoveryAfterCommit(t *testing.T) {
 
 	firstCancel()
 
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// The first consumer is stuck in DeleteMessage after its commit, as if the
+	// process were about to die. Stop waits for in-flight work only until its
+	// deadline, then aborts it and releases the message for redelivery.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
 	defer stopCancel()
 
-	if err := firstConsumer.Stop(stopCtx); err != nil {
-		t.Fatal(err)
+	if err := firstConsumer.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected the stuck delete to hit the stop deadline, got %v", err)
 	}
 
 	secondSQSConsumer, err := sqsInfra.NewConsumer(sqsClient)
