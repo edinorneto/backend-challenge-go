@@ -348,7 +348,7 @@ func (r *WalletRepo) GetLedger(ctx context.Context, walletID uuid.UUID, cursor s
 	if hasCursor {
 		decoded, err := base64.RawURLEncoding.DecodeString(cursor)
 		if err != nil {
-			return nil, "", fmt.Errorf("decode ledger cursor: %w", err)
+			return nil, "", ErrInvalidLedgerCursor
 		}
 		parts := strings.Split(string(decoded), "|")
 		if len(parts) != 2 {
