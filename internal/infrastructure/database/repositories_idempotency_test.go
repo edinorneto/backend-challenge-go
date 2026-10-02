@@ -318,12 +318,17 @@ func TestProcessTransactionConcurrentBetsLockOneWallet(t *testing.T) {
 	errs := make([]error, 2)
 	var group sync.WaitGroup
 	group.Add(2)
+	// Both goroutines wait at the barrier, so the two bets reach the database
+	// together instead of in launch order.
+	start := make(chan struct{})
 	for index := range requests {
 		go func(index int) {
 			defer group.Done()
+			<-start
 			results[index], errs[index] = repo.ProcessTransaction(context.Background(), requests[index])
 		}(index)
 	}
+	close(start)
 	group.Wait()
 
 	processed := 0
