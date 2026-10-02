@@ -165,3 +165,34 @@ func TestWageringServiceRequiresReferenceForReversals(t *testing.T) {
 		}
 	}
 }
+
+func TestWageringPayloadIsCanonicalJSONWithSortedKeys(t *testing.T) {
+	amount, err := money.ParseExternal("25.5", "BRL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	playerID := uuid.MustParse("0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1")
+	walletID := uuid.MustParse("0192f291-27dd-7d3f-8071-5f8685deef37")
+
+	body, err := canonicalPayload("provider-a", "tx&1", playerID, walletID, "round-987", "fortune-chimp", "REFUND", amount, "bet-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := `{"externalTransactionId":"tx&1","gameId":"fortune-chimp","kind":"REFUND","money":{"amount":"25.50","currency":"BRL"},` +
+		`"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","providerId":"provider-a","referenceExternalTransactionId":"bet-1",` +
+		`"roundId":"round-987","walletId":"0192f291-27dd-7d3f-8071-5f8685deef37"}`
+	if string(body) != expected {
+		t.Fatalf("unexpected canonical payload:\n got %s\nwant %s", body, expected)
+	}
+
+	// Equivalent amounts are normalized before hashing.
+	normalized, err := money.ParseExternal("25.50", "BRL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := computePayloadHash("provider-a", "tx&1", playerID, walletID, "round-987", "fortune-chimp", "REFUND", amount, "bet-1")
+	second, _ := computePayloadHash("provider-a", "tx&1", playerID, walletID, "round-987", "fortune-chimp", "REFUND", normalized, "bet-1")
+	if first != second {
+		t.Fatal("25.5 and 25.50 must produce the same hash")
+	}
+}

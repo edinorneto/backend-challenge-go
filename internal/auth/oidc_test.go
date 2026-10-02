@@ -338,3 +338,13 @@ func TestMiddlewareRecordsAuthenticationFailures(t *testing.T) {
 		t.Fatalf("authentication logs must not contain tokens or verifier messages: %s", logs)
 	}
 }
+
+func TestMiddlewareErrorsAreJSON(t *testing.T) {
+	handler := NewMiddleware(newOIDCTestServer(t).verifier(t)).Require(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), RoleWageringProvider)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/wallets/x", nil))
+	if recorder.Code != http.StatusUnauthorized || recorder.Header().Get("Content-Type") != "application/json" ||
+		recorder.Body.String() != `{"error":"authentication_required"}` {
+		t.Fatalf("expected a JSON 401, got %d %q %s", recorder.Code, recorder.Header().Get("Content-Type"), recorder.Body.String())
+	}
+}

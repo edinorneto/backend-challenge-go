@@ -1,6 +1,7 @@
 package application
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -129,6 +130,14 @@ func (s *WageringService) GetTransactionByExternal(ctx context.Context, provider
 	return s.repo.GetTransactionByExternal(ctx, providerID, externalTransactionID)
 }
 
+// computePayloadHash returns the SHA-256 (hex) of the canonical JSON of the
+// operation's business fields, the same for HTTP and SQS. Canonical means keys
+// sorted at every level (encoding/json sorts map keys), no insignificant
+// whitespace and no HTML escaping. Values are normalized first: kind is upper
+// case and trimmed, money is the normalized two-decimal amount ("25.5" and
+// "25.50" hash alike) and the currency code. The idempotency key and transport
+// metadata (messageId, occurredAt, headers) are excluded; the provider comes
+// from the authenticated identity on HTTP and from data.providerId on SQS.
 func computePayloadHash(
 	providerID string,
 	externalTransactionID string,
@@ -140,44 +149,45 @@ func computePayloadHash(
 	amount money.Money,
 	referenceExternalTransactionID string,
 ) (string, error) {
-	payload := struct {
-		ProviderID            string `json:"providerId"`
-		ExternalTransactionID string `json:"externalTransactionId"`
-		PlayerID              string `json:"playerId"`
-		WalletID              string `json:"walletId"`
-		RoundID               string `json:"roundId"`
-		GameID                string `json:"gameId"`
-		Kind                  string `json:"kind"`
-		Money                 struct {
-			Amount   string `json:"amount"`
-			Currency string `json:"currency"`
-		} `json:"money"`
-		ReferenceExternalTransactionID string `json:"referenceExternalTransactionId,omitempty"`
-	}{
-		ProviderID:            providerID,
-		ExternalTransactionID: externalTransactionID,
-		PlayerID:              playerID.String(),
-		WalletID:              walletID.String(),
-		RoundID:               roundID,
-		GameID:                gameID,
-		Kind:                  kind,
-		Money: struct {
-			Amount   string `json:"amount"`
-			Currency string `json:"currency"`
-		}{
-			Amount:   amount.String(),
-			Currency: amount.Currency(),
-		},
-		ReferenceExternalTransactionID: referenceExternalTransactionID,
-	}
-
-	body, err := json.Marshal(payload)
+	body, err := canonicalPayload(providerID, externalTransactionID, playerID, walletID, roundID, gameID, kind, amount, referenceExternalTransactionID)
 	if err != nil {
 		return "", err
 	}
-
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func canonicalPayload(
+	providerID string,
+	externalTransactionID string,
+	playerID uuid.UUID,
+	walletID uuid.UUID,
+	roundID string,
+	gameID string,
+	kind string,
+	amount money.Money,
+	referenceExternalTransactionID string,
+) ([]byte, error) {
+	payload := map[string]any{
+		"externalTransactionId": externalTransactionID,
+		"gameId":                gameID,
+		"kind":                  kind,
+		"money":                 map[string]string{"amount": amount.String(), "currency": amount.Currency()},
+		"playerId":              playerID.String(),
+		"providerId":            providerID,
+		"roundId":               roundID,
+		"walletId":              walletID.String(),
+	}
+	if referenceExternalTransactionID != "" {
+		payload["referenceExternalTransactionId"] = referenceExternalTransactionID
+	}
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(payload); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
 }
 
 // record emits the metrics and the log line of one operation. Labels come from

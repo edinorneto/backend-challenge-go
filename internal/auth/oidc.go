@@ -147,7 +147,7 @@ func (m *Middleware) reject(w http.ResponseWriter, r *http.Request, status int, 
 			m.logger.Info(r.Context(), "authentication_failed", fields)
 		}
 	}
-	http.Error(w, `{"error":"`+reason+`"}`, status)
+	writeError(w, status, reason)
 }
 
 // Require authenticates the request and demands every listed role.
@@ -177,7 +177,7 @@ func (m *Middleware) RequireAny(next http.Handler, roles ...string) http.Handler
 func (m *Middleware) authenticate(next http.Handler, authorized func(Identity) bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if m == nil || m.verifier == nil {
-			http.Error(w, `{"error":"authentication_unavailable"}`, http.StatusServiceUnavailable)
+			writeError(w, http.StatusServiceUnavailable, "authentication_unavailable")
 			return
 		}
 		const prefix = "Bearer "
@@ -197,4 +197,11 @@ func (m *Middleware) authenticate(next http.Handler, authorized func(Identity) b
 		}
 		next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), identity)))
 	})
+}
+
+// writeError answers with the same JSON error shape as the rest of the API.
+func writeError(w http.ResponseWriter, status int, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(`{"error":"` + code + `"}`))
 }

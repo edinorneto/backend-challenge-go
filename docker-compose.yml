@@ -65,6 +65,9 @@ services:
     deploy:
       replicas: 3
     restart: unless-stopped
+    # Longer than Fx's default 15 s stop timeout, so SIGTERM can drain the
+    # in-flight work before Docker sends SIGKILL.
+    stop_grace_period: 20s
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/betting?sslmode=disable
       HTTP_ADDR: :8080

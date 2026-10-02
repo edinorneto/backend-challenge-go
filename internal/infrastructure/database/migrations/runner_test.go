@@ -116,16 +116,20 @@ func TestRunnerDownRevertsLatestMigrations(t *testing.T) {
 	if err := runner.Up(ctx); err != nil {
 		t.Fatalf("up: %v", err)
 	}
+	latest, err := latestMigrationVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := runner.Down(ctx, 1); err != nil {
 		t.Fatalf("down one: %v", err)
 	}
-	var count int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
-		t.Fatal(err)
+	assertMigrationCount(t, pool, int(latest-1))
+	assertExists(t, pool, `SELECT to_regclass('uq_wager_opening_per_wallet') IS NOT NULL`, false, "OPENING uniqueness index")
+
+	if err := runner.Down(ctx, 1); err != nil {
+		t.Fatalf("down two: %v", err)
 	}
-	if count != 3 {
-		t.Fatalf("expected three migrations after one revert, got %d", count)
-	}
+	assertMigrationCount(t, pool, int(latest-2))
 	var outboxTriggers int
 	if err := pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM pg_trigger
@@ -137,7 +141,7 @@ func TestRunnerDownRevertsLatestMigrations(t *testing.T) {
 		t.Fatal("expected outbox snapshot trigger to be dropped by its revert")
 	}
 
-	if err := runner.Down(ctx, 3); err != nil {
+	if err := runner.Down(ctx, int(latest-2)); err != nil {
 		t.Fatalf("down remaining: %v", err)
 	}
 	var remaining int

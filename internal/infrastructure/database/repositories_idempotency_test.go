@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/edinorneto/backend-challenge-go/internal/domain/money"
@@ -1395,5 +1396,29 @@ func TestProcessTransactionRecordsWalletLockContention(t *testing.T) {
 	<-released
 	if got := metrics.Snapshot("wallet_lock_contended_total"); got != 1 {
 		t.Fatalf("expected the waiting operation to be counted as contention, got %d", got)
+	}
+}
+
+// The schema, not only the wallet-opening code, prevents a second initial credit.
+func TestSchemaRejectsSecondOpeningForAWallet(t *testing.T) {
+	pool := testPool(t)
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `SELECT to_regclass('uq_wager_opening_per_wallet') IS NOT NULL`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("migration 000005 is not applied: run the migrations before the integration tests")
+	}
+	repo := database.NewWalletRepo(pool)
+	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO wager_transactions (id, source, player_id, wallet_id, kind, status, amount_cents, currency,
+			result_balance_cents, result_wallet_version, reference_attempts, created_at, updated_at, processed_at)
+		VALUES ($1, 'INTERNAL', $2, $3, 'OPENING', 'PROCESSED', 5000, 'BRL', 5000, 1, 0, NOW(), NOW(), NOW())
+	`, uuid.New(), playerID, walletID)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" || pgErr.ConstraintName != "uq_wager_opening_per_wallet" {
+		t.Fatalf("expected the second OPENING to violate uq_wager_opening_per_wallet, got %v", err)
 	}
 }
