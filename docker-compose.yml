@@ -49,10 +49,22 @@ services:
       - "8081:8080"
     volumes:
       - "./keycloak:/opt/keycloak/data/import"
+    healthcheck:
+      # The realm endpoint answers only after the realm import finished.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /realms/backend/.well-known/openid-configuration HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
 
   application:
     build:
       context: .
+    # Three independent processes by default (own memory, pools, consumers,
+    # publisher and reference worker); override with --scale application=N.
+    deploy:
+      replicas: 3
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/betting?sslmode=disable
       HTTP_ADDR: :8080
@@ -66,6 +78,7 @@ services:
       OIDC_PROVIDER_CLAIM: ${OIDC_PROVIDER_CLAIM:-provider_id}
       SQS_TRANSACTION_QUEUE: ${SQS_TRANSACTION_QUEUE:-wager-transactions.fifo}
       SQS_TRANSACTION_DLQ: ${SQS_TRANSACTION_DLQ:-wager-transactions-dlq.fifo}
+      SQS_EVENT_QUEUE: ${SQS_EVENT_QUEUE:-wager-events.fifo}
       SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
     expose:
       - "8080"
@@ -79,6 +92,7 @@ services:
 
   nginx:
     image: nginx:1.27-alpine
+    restart: unless-stopped
     ports:
       - "8080:8080"
     volumes:
@@ -86,6 +100,12 @@ services:
     depends_on:
       application:
         condition: service_started
+    healthcheck:
+      # End-to-end readiness through the proxy: some instance reaches PostgreSQL and SQS.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
 volumes:
   postgres_data:

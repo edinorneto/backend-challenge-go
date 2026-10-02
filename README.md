@@ -5,19 +5,23 @@
 Copy `.env.example` to `.env` when running the stack with custom values. The
 default Compose values are local-only credentials for PostgreSQL and LocalStack.
 
-Start PostgreSQL, LocalStack/SQS, and the API:
+Start the whole stack and wait until it is ready:
 
 ```sh
-docker compose up --build
+docker compose up -d --build --wait
 ```
+
+`--wait` returns when PostgreSQL, LocalStack (with its queues), Keycloak (with the
+imported realm) and Nginx (which proxies `/health/ready` to the API) are healthy;
+on a clean machine this took about 40 seconds after the images were built.
 
 The stack provides:
 
+- the API at `localhost:8080`, served by Nginx in front of **three independent
+  application instances** (`deploy.replicas: 3`);
 - PostgreSQL at `localhost:5432`;
-- LocalStack at `localhost:4566`;
-- the API at `localhost:8080`;
-- `wager-transactions.fifo`;
-- `wager-transactions-dlq.fifo`.
+- LocalStack at `localhost:4566`, with `wager-transactions.fifo`,
+  `wager-transactions-dlq.fifo` and the output queue `wager-events.fifo`;
 - Keycloak at `http://localhost:8081`, with realm `backend`.
 
 The protected wagering endpoint requires a Bearer token issued by
@@ -41,7 +45,7 @@ account. Wagering operations require the `wagering-provider` realm role, granted
 to `provider-a` and `provider-b`; the internal service cannot submit them.
 Health checks remain public.
 
-LocalStack creates both FIFO queues from
+LocalStack creates the three FIFO queues from
 `localstack/init/ready.d/01-init-sqs.sh`. The transaction queue has a redrive
 policy to the FIFO DLQ and uses content-based deduplication. The receive limit
 is controlled by `SQS_MAX_RECEIVE_COUNT`.
@@ -93,7 +97,7 @@ docker compose up -d postgres
 docker compose stop application
 docker compose run --rm --no-deps --entrypoint /app/migrate application -direction down -steps 1
 docker compose run --rm --no-deps --entrypoint /app/migrate application -direction up
-docker compose up -d --scale application=3
+docker compose up -d
 ```
 
 In Git Bash on Windows, prefix those commands with `MSYS_NO_PATHCONV=1` so
@@ -110,11 +114,14 @@ go run ./cmd/migrate -direction down -steps 1
 The command exits with `0` on success, `1` on a database or migration failure,
 and `2` on invalid usage (unknown direction or `-steps` below 1).
 
-For the multi-instance checks, keep one PostgreSQL/LocalStack/Keycloak stack and
-scale only the API workers behind Nginx:
+Multiple instances: the default stack already runs three application processes,
+each with its own memory, connection pool, SQS consumer, outbox publisher and
+reference worker; they share only PostgreSQL and SQS. Nginx re-resolves the
+service name, so instances added or restarted later receive traffic. Use another
+count with:
 
 ```powershell
-docker compose up -d --build --scale application=3
+docker compose up -d --scale application=5
 ```
 
 The recommended verification commands are:

@@ -259,11 +259,37 @@ not use SQL offsets. Reconciliation runs in a read transaction, sums credits
 and debits including the opening entry, reports the difference from the stored
 wallet balance, and never mutates the wallet or ledger.
 
-The application can run as multiple independent Compose instances. Each
+### Multiple instances
+
+Compose runs three application replicas by default (`deploy.replicas: 3`). Each
 instance has its own memory, connection pool, consumers, publisher, and
 pending-reference worker, while financial state is shared through PostgreSQL
-and SQS. An Nginx reverse proxy provides the single external HTTP endpoint and
-forwards requests to the scaled application service.
+and SQS. No component relies on in-process state for correctness: idempotency,
+pending references and outbox claims are rows, wallet coordination uses row
+locks, and each outbox publisher has a random owner token. An Nginx reverse
+proxy provides the single external HTTP endpoint. It re-resolves the Docker DNS
+name every 5 seconds, so scaled or restarted replicas receive traffic.
+Non-idempotent requests are not retried on another upstream after being sent
+(Nginx default).
+
+Verified with a clean Compose project:
+
+- `docker compose up -d --build --wait` became ready in about 40 seconds;
+- the full integration suite passed against it;
+- 30 requests were balanced 10/10/10 across the replicas;
+- 60 outbox events created through HTTP were published by all three
+  publishers (20/25/20), with no duplicate claims.
+
+`SIGTERM` (`docker stop`) shuts an instance down in about 0.4 s with exit
+code 0. The order is: HTTP server, then messaging workers (cancelling the SQS
+long poll), then the PostgreSQL pool. That fits Docker's 10-second grace period.
+
+Compose health checks: PostgreSQL (`pg_isready`), LocalStack (all three queues
+resolvable), Keycloak (the `backend` realm discovery document answers `200`, so
+the import has finished) and Nginx (`/health/ready` through the proxy). The
+application image is distroless and has no shell, so it has no Compose health
+check of its own; Nginx's check covers it end to end. Application and Nginx use
+`restart: unless-stopped`.
 
 ## Observability
 
