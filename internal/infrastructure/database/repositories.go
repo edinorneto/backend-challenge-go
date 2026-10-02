@@ -19,6 +19,7 @@ import (
 	"github.com/edinorneto/backend-challenge-go/internal/domain/wagertransaction"
 	"github.com/edinorneto/backend-challenge-go/internal/domain/wallet"
 	"github.com/edinorneto/backend-challenge-go/internal/messaging"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
@@ -26,9 +27,9 @@ var ErrInvalidLedgerCursor = errors.New("invalid ledger cursor")
 
 var (
 	ErrWalletAlreadyExists         = errors.New("wallet already exists")
-	ErrWalletNotFound              = errors.New("wallet not found")
-	ErrIdempotencyConflict         = errors.New("idempotency conflict")
-	ErrExternalTransactionConflict = errors.New("external transaction conflict")
+	ErrWalletNotFound              = ports.ErrWalletNotFound
+	ErrIdempotencyConflict         = ports.ErrIdempotencyConflict
+	ErrExternalTransactionConflict = ports.ErrExternalTransactionConflict
 	ErrReferenceNotFound           = errors.New("reference transaction not found")
 	ErrReferenceIncompatible       = errors.New("reference transaction incompatible")
 	ErrDuplicateReversal           = errors.New("duplicate reversal")
@@ -53,11 +54,34 @@ const (
 )
 
 type WalletRepo struct {
-	DB *pgxpool.Pool
+	DB      *pgxpool.Pool
+	metrics *observability.Metrics
 }
 
 func NewWalletRepo(db *pgxpool.Pool) *WalletRepo {
 	return &WalletRepo{DB: db}
+}
+
+// WithMetrics enables the wallet lock metrics.
+func (r *WalletRepo) WithMetrics(metrics *observability.Metrics) *WalletRepo {
+	r.metrics = metrics
+	return r
+}
+
+// contendedLockWait approximates "another writer held this wallet": acquiring
+// an uncontended row lock takes well under a millisecond locally.
+const contendedLockWait = 5 * time.Millisecond
+
+// observeWalletLock records how long an operation waited for its wallet lock,
+// which is how concurrent writers of one wallet show up.
+func (r *WalletRepo) observeWalletLock(wait time.Duration) {
+	if r.metrics == nil {
+		return
+	}
+	r.metrics.Observe("wallet_lock_wait", wait)
+	if wait >= contendedLockWait {
+		r.metrics.Inc("wallet_lock_contended_total")
+	}
 }
 
 func (r *WalletRepo) Create(ctx context.Context, w *wallet.Wallet) error {
@@ -614,6 +638,7 @@ func (r *WalletRepo) ProcessTransaction(
 	// not conflict with the FOR KEY SHARE lock that the wager_transactions insert
 	// above (foreign key to wallets) already holds in concurrent transactions.
 	// FOR UPDATE would make two concurrent operations on the same wallet deadlock.
+	lockStarted := time.Now()
 	err = tx.QueryRow(
 		ctx,
 		`SELECT player_id, currency, balance_cents, version, created_at, updated_at FROM wallets WHERE id = $1 FOR NO KEY UPDATE`,
@@ -632,6 +657,7 @@ func (r *WalletRepo) ProcessTransaction(
 		}
 		return ports.ProcessTransactionResult{}, fmt.Errorf("lock wallet: %w", err)
 	}
+	r.observeWalletLock(time.Since(lockStarted))
 
 	walletBalance, err := money.FromCents(walletRow.balanceCents, walletRow.currency)
 	if err != nil {
@@ -1125,6 +1151,7 @@ func (r *WalletRepo) retryPendingReferenceTx(ctx context.Context, tx pgx.Tx, tra
 		createdAt    time.Time
 		updatedAt    time.Time
 	}{}
+	lockStarted := time.Now()
 	if err := tx.QueryRow(ctx, `
 		SELECT player_id, currency, balance_cents, version, created_at, updated_at
 		FROM wallets WHERE id = $1 FOR NO KEY UPDATE
@@ -1137,6 +1164,7 @@ func (r *WalletRepo) retryPendingReferenceTx(ctx context.Context, tx pgx.Tx, tra
 		}
 		return ports.ProcessTransactionResult{}, fmt.Errorf("lock wallet for reference retry: %w", err)
 	}
+	r.observeWalletLock(time.Since(lockStarted))
 	walletBalance, err := money.FromCents(walletRow.balanceCents, walletRow.currency)
 	if err != nil {
 		return ports.ProcessTransactionResult{}, fmt.Errorf("rehydrate retry wallet balance: %w", err)

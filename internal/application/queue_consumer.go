@@ -294,6 +294,9 @@ func (c *QueueConsumer) processCommand(ctx context.Context, message ports.QueueM
 	if err := command.Validate(); err != nil {
 		return fmt.Errorf("validate transaction command %s: %w", message.MessageID, err)
 	}
+	// For SQS the envelope messageId is the correlation ID of every log line of
+	// this command, as the Correlation-ID header is for HTTP.
+	ctx = observability.WithCorrelationID(ctx, command.MessageID)
 	if c.logger != nil {
 		c.logger.Info(ctx, "consumer_command_validated", map[string]string{
 			"messageId": command.MessageID, "walletId": command.Data.WalletID.String(), "providerId": command.Data.ProviderID,
@@ -320,20 +323,9 @@ func (c *QueueConsumer) processCommand(ctx context.Context, message ports.QueueM
 			Amount:                         amount,
 			ReferenceExternalTransactionID: command.Data.ReferenceExternalTransactionID,
 		})
+		// Results, replays and rejections are counted by the wagering service for
+		// both channels; the consumer only adds what is specific to SQS.
 		if err == nil {
-			if c.metrics != nil {
-				c.metrics.Inc("wager_results_total")
-				if result.IdempotentReplay {
-					c.metrics.Inc("idempotency_replays_total")
-				}
-				if result.Status == "REJECTED" {
-					c.metrics.Inc("wager_rejections_total")
-				}
-				if result.FailureCode == "insufficient_funds" ||
-					result.FailureCode == "reversal_insufficient_funds" {
-					c.metrics.Inc("wager_balance_conflicts_total")
-				}
-			}
 			if c.logger != nil {
 				fields := map[string]string{
 					"messageId": command.MessageID, "walletId": command.Data.WalletID.String(),

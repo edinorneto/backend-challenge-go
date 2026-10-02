@@ -1,11 +1,13 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/edinorneto/backend-challenge-go/internal/config"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 )
 
 type oidcTestServer struct {
@@ -287,5 +290,51 @@ func TestMiddlewareRoleAuthorization(t *testing.T) {
 				t.Fatalf("expected %d, got %d", tc.want, got)
 			}
 		})
+	}
+}
+
+func TestMiddlewareRecordsAuthenticationFailures(t *testing.T) {
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	server := newOIDCTestServer(t)
+	metrics := observability.NewMetrics()
+	middleware := NewMiddleware(server.verifier(t)).WithObservability(observability.NewLogger(), metrics)
+	handler := middleware.Require(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), RoleWageringProvider)
+
+	expired := server.token(t, "provider-a", time.Now().Add(-time.Minute), server.server.URL, server.key)
+	internalOnly := server.token(t, "provider-a", time.Now().Add(time.Hour), server.server.URL, server.key)
+	for _, tc := range []struct {
+		header string
+		status int
+		reason string
+	}{
+		{"", http.StatusUnauthorized, "authentication_required"},
+		{"Bearer " + expired, http.StatusUnauthorized, "invalid_token"},
+		{"Bearer " + internalOnly, http.StatusForbidden, "forbidden"},
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/wagering/transactions", nil)
+		if tc.header != "" {
+			request.Header.Set("Authorization", tc.header)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != tc.status || !strings.Contains(recorder.Body.String(), tc.reason) {
+			t.Fatalf("expected %d %s, got %d %s", tc.status, tc.reason, recorder.Code, recorder.Body.String())
+		}
+		if got := metrics.SnapshotLabeled("auth_failures_total", map[string]string{"reason": tc.reason}); got != 1 {
+			t.Fatalf("expected one %s failure, got %d", tc.reason, got)
+		}
+	}
+	logs := output.String()
+	if strings.Count(logs, `"message":"authentication_failed"`) != 3 || !strings.Contains(logs, `"errorClass"`) {
+		t.Fatalf("expected one structured log per rejected request: %s", logs)
+	}
+	if strings.Contains(logs, expired) || strings.Contains(logs, internalOnly) || strings.Contains(logs, "expired") {
+		t.Fatalf("authentication logs must not contain tokens or verifier messages: %s", logs)
 	}
 }

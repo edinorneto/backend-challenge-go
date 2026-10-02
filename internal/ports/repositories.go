@@ -182,3 +182,11 @@ type InboxEffect = func(ctx context.Context, envelope []byte) error
 type InboxRepository interface {
 	Process(ctx context.Context, consumerName string, messageID string, payload []byte, effect InboxEffect) (duplicate bool, err error)
 }
+
+// OutboxBacklogReader is implemented by outbox repositories that can report the
+// events still waiting to be published.
+type OutboxBacklogReader interface {
+	// PendingBacklog returns how many events are pending and when the oldest
+	// pending one occurred (zero time when there is none).
+	PendingBacklog(ctx context.Context) (int64, time.Time, error)
+}

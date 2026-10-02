@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 
 	"github.com/edinorneto/backend-challenge-go/internal/config"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 )
 
 type identityKey struct{}
@@ -118,10 +118,36 @@ func providerClaim(raw map[string]json.RawMessage, name string) (string, error) 
 
 type Middleware struct {
 	verifier *Verifier
+	logger   *observability.Logger
+	metrics  *observability.Metrics
 }
 
 func NewMiddleware(verifier *Verifier) *Middleware {
 	return &Middleware{verifier: verifier}
+}
+
+// WithObservability enables the authentication failure log and metric.
+func (m *Middleware) WithObservability(logger *observability.Logger, metrics *observability.Metrics) *Middleware {
+	m.logger = logger
+	m.metrics = metrics
+	return m
+}
+
+// reject answers an authentication or authorization failure and records it. The
+// token and the verifier error message are never logged.
+func (m *Middleware) reject(w http.ResponseWriter, r *http.Request, status int, reason string, err error) {
+	if m.metrics != nil {
+		m.metrics.IncLabeled("auth_failures_total", map[string]string{"reason": reason})
+	}
+	if m.logger != nil {
+		fields := map[string]string{"result": reason, "route": r.Pattern}
+		if err != nil {
+			m.logger.Error(r.Context(), "authentication_failed", err, fields)
+		} else {
+			m.logger.Info(r.Context(), "authentication_failed", fields)
+		}
+	}
+	http.Error(w, `{"error":"`+reason+`"}`, status)
 }
 
 // Require authenticates the request and demands every listed role.
@@ -157,17 +183,16 @@ func (m *Middleware) authenticate(next http.Handler, authorized func(Identity) b
 		const prefix = "Bearer "
 		header := r.Header.Get("Authorization")
 		if !strings.HasPrefix(header, prefix) {
-			http.Error(w, `{"error":"authentication_required"}`, http.StatusUnauthorized)
+			m.reject(w, r, http.StatusUnauthorized, "authentication_required", nil)
 			return
 		}
 		identity, err := m.verifier.Verify(r.Context(), strings.TrimSpace(strings.TrimPrefix(header, prefix)))
 		if err != nil {
-			log.Printf("OIDC verification failed: %v", err)
-			http.Error(w, `{"error":"invalid_token"}`, http.StatusUnauthorized)
+			m.reject(w, r, http.StatusUnauthorized, "invalid_token", err)
 			return
 		}
 		if !authorized(identity) {
-			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			m.reject(w, r, http.StatusForbidden, "forbidden", nil)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), identity)))

@@ -152,3 +152,20 @@ func scanOutboxEvents(rows pgx.Rows) ([]ports.OutboxEvent, error) {
 	}
 	return events, nil
 }
+
+// PendingBacklog reports the events not yet published, across all publishers.
+func (r *OutboxRepo) PendingBacklog(ctx context.Context) (int64, time.Time, error) {
+	var count int64
+	var oldest *time.Time
+	if err := r.DB.QueryRow(ctx, `
+		SELECT COUNT(*), MIN(occurred_at) FROM outbox_events WHERE status = 'PENDING'
+	`).Scan(&count, &oldest); err != nil {
+		return 0, time.Time{}, fmt.Errorf("read outbox backlog: %w", err)
+	}
+	if oldest == nil {
+		return count, time.Time{}, nil
+	}
+	return count, *oldest, nil
+}
+
+var _ ports.OutboxBacklogReader = (*OutboxRepo)(nil)

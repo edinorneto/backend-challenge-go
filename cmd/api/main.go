@@ -35,14 +35,18 @@ func AppOptions() fx.Option {
 			observability.NewLogger,
 			observability.NewMetrics,
 			auth.NewVerifier,
-			auth.NewMiddleware,
+			func(verifier *auth.Verifier, logger *observability.Logger, metrics *observability.Metrics) *auth.Middleware {
+				return auth.NewMiddleware(verifier).WithObservability(logger, metrics)
+			},
 			database.NewPool,
 			migrations.NewRunner,
 			sqs.NewClient,
 			sqs.NewQueueManager,
 			sqs.NewConsumer,
 			database.NewTransactionManager,
-			database.NewWalletRepo,
+			func(pool *pgxpool.Pool, metrics *observability.Metrics) *database.WalletRepo {
+				return database.NewWalletRepo(pool).WithMetrics(metrics)
+			},
 			database.NewOutboxRepo,
 			database.NewInboxRepo,
 			func(repo *database.WalletRepo) ports.WalletRepository {
@@ -64,7 +68,9 @@ func AppOptions() fx.Option {
 			func(repo ports.WalletRepository, logger *observability.Logger, metrics *observability.Metrics) *application.WalletService {
 				return application.NewWalletService(repo, logger, metrics)
 			},
-			application.NewWageringService,
+			func(repo ports.WageringRepository, logger *observability.Logger, metrics *observability.Metrics) *application.WageringService {
+				return application.NewWageringService(repo, logger, metrics)
+			},
 			func(repo ports.OutboxRepository, publisher ports.OutboxMessagePublisher, cfg config.Config, logger *observability.Logger, metrics *observability.Metrics) *application.OutboxPublisher {
 				return application.NewOutboxPublisher(repo, publisher, cfg, logger, metrics)
 			},

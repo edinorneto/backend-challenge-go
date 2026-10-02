@@ -113,8 +113,16 @@ func (p *OutboxPublisher) loop(ctx context.Context) {
 	defer ticker.Stop()
 
 	for {
+		p.recordBacklog(ctx)
 		if err := p.publishPending(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("outbox publisher: %v", err)
+			if p.logger != nil {
+				p.logger.Error(ctx, "outbox_publish_cycle_failed", err, map[string]string{"owner": p.owner})
+			} else {
+				log.Printf("outbox publisher: %v", err)
+			}
+			if p.metrics != nil {
+				p.metrics.Inc("outbox_cycle_failures_total")
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -157,11 +165,6 @@ func (p *OutboxPublisher) publishPending(ctx context.Context) error {
 	if p.logger != nil {
 		for _, event := range events {
 			p.logger.Info(ctx, "outbox_event_claimed", map[string]string{"eventId": event.EventID.String(), "aggregateId": event.AggregateID.String(), "attempt": fmt.Sprint(event.Attempts + 1), "owner": p.owner})
-		}
-	}
-	if p.metrics != nil {
-		for _, event := range events {
-			p.metrics.Observe("outbox_lag", time.Since(event.CreatedAt))
 		}
 	}
 
@@ -212,6 +215,9 @@ func (p *OutboxPublisher) publishEvent(ctx context.Context, event ports.OutboxEv
 	if err == nil {
 		if p.metrics != nil {
 			p.metrics.Inc("outbox_published_total")
+			// End-to-end delay between the commit that produced the event and its
+			// publication.
+			p.metrics.Observe("outbox_lag", time.Since(event.OccurredAt))
 		}
 		if p.logger != nil {
 			p.logger.Info(ctx, "outbox_event_published", map[string]string{"eventId": event.EventID.String(), "aggregateId": event.AggregateID.String()})
@@ -255,4 +261,24 @@ func marshalEnvelope(event ports.OutboxEvent) ([]byte, error) {
 		return nil, fmt.Errorf("validate event envelope: %w", err)
 	}
 	return json.Marshal(envelope)
+}
+
+// recordBacklog exposes the events still waiting to be published. Unlike
+// outbox_lag, which is observed only when an event is published, these gauges
+// keep growing while publication is stuck (SQS down, every publisher stopped).
+func (p *OutboxPublisher) recordBacklog(ctx context.Context) {
+	reader, ok := p.repo.(ports.OutboxBacklogReader)
+	if !ok || p.metrics == nil {
+		return
+	}
+	count, oldest, err := reader.PendingBacklog(ctx)
+	if err != nil {
+		return
+	}
+	p.metrics.SetGauge("outbox_pending_events", float64(count))
+	age := 0.0
+	if !oldest.IsZero() {
+		age = time.Since(oldest).Seconds()
+	}
+	p.metrics.SetGauge("outbox_oldest_pending_seconds", age)
 }

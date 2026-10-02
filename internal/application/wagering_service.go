@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/edinorneto/backend-challenge-go/internal/domain/money"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
@@ -23,16 +25,40 @@ var (
 type WageringRequest = ports.WageringRequest
 
 type WageringService struct {
-	repo ports.WageringRepository
+	repo    ports.WageringRepository
+	logger  *observability.Logger
+	metrics *observability.Metrics
 }
 
 var _ ports.WageringService = (*WageringService)(nil)
 
-func NewWageringService(repo ports.WageringRepository) *WageringService {
-	return &WageringService{repo: repo}
+func NewWageringService(repo ports.WageringRepository, options ...any) *WageringService {
+	service := &WageringService{repo: repo}
+	for _, option := range options {
+		switch value := option.(type) {
+		case *observability.Logger:
+			service.logger = value
+		case *observability.Metrics:
+			service.metrics = value
+		}
+	}
+	return service
 }
 
+// ProcessTransaction is the single entry point for HTTP and SQS operations, so
+// results, latency and conflicts are measured here once for both channels.
 func (s *WageringService) ProcessTransaction(
+	ctx context.Context,
+	idempotencyKey string,
+	req ports.WageringRequest,
+) (ports.ProcessTransactionResult, error) {
+	started := time.Now()
+	result, err := s.process(ctx, idempotencyKey, req)
+	s.record(ctx, req, result, err, time.Since(started))
+	return result, err
+}
+
+func (s *WageringService) process(
 	ctx context.Context,
 	idempotencyKey string,
 	req ports.WageringRequest,
@@ -152,4 +178,66 @@ func computePayloadHash(
 
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// record emits the metrics and the log line of one operation. Labels come from
+// fixed sets (status, failure code, error kind, SQLSTATE); identifiers go only
+// to the log.
+func (s *WageringService) record(ctx context.Context, req ports.WageringRequest, result ports.ProcessTransactionResult, err error, duration time.Duration) {
+	outcome := operationOutcome(err)
+	if s.metrics != nil {
+		s.metrics.Observe("wager_processing_duration", duration)
+		if err != nil {
+			s.metrics.IncLabeled("wager_errors_total", map[string]string{"kind": outcome})
+			if class := observability.ErrorClass(err); class == "postgres_40P01" || class == "postgres_40001" {
+				s.metrics.IncLabeled("db_concurrency_conflicts_total", map[string]string{"sqlstate": strings.TrimPrefix(class, "postgres_")})
+			}
+		} else {
+			s.metrics.IncLabeled("wager_results_total", map[string]string{"status": result.Status})
+			if result.Status == "REJECTED" {
+				s.metrics.IncLabeled("wager_rejections_total", map[string]string{"failure_code": result.FailureCode})
+			}
+			if result.IdempotentReplay {
+				s.metrics.Inc("idempotency_replays_total")
+			}
+		}
+	}
+	if s.logger == nil {
+		return
+	}
+	fields := map[string]string{
+		"providerId": req.ProviderID,
+		"walletId":   req.WalletID.String(),
+		"operation":  strings.ToUpper(strings.TrimSpace(req.Kind)),
+		"duration":   duration.String(),
+	}
+	if err != nil {
+		fields["result"] = outcome
+		s.logger.Error(ctx, "wager_transaction_failed", err, fields)
+		return
+	}
+	fields["transactionId"] = result.TransactionID.String()
+	fields["status"] = result.Status
+	fields["replay"] = fmt.Sprint(result.IdempotentReplay)
+	if result.FailureCode != "" {
+		fields["failureCode"] = result.FailureCode
+	}
+	s.logger.Info(ctx, "wager_transaction_completed", fields)
+}
+
+func operationOutcome(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, ErrIdempotencyKeyRequired), errors.Is(err, ErrInvalidWagerRequest):
+		return "invalid_request"
+	case errors.Is(err, ports.ErrIdempotencyConflict):
+		return "idempotency_conflict"
+	case errors.Is(err, ports.ErrExternalTransactionConflict):
+		return "external_transaction_conflict"
+	case errors.Is(err, ports.ErrWalletNotFound):
+		return "wallet_not_found"
+	default:
+		return "infrastructure"
+	}
 }

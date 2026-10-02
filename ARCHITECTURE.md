@@ -402,19 +402,63 @@ check of its own; Nginx's check covers it end to end. Application and Nginx use
 
 ## Observability
 
-HTTP requests and asynchronous worker transitions use a small structured JSON
-logger. Logs contain UTC timestamps, level, event name, safe identifiers and
-durations when available. `Correlation-ID` is propagated through the request
-context and response; a UUID is generated when the client does not provide
-one. Authorization headers, tokens, secrets, passwords and complete financial
-payloads are not fields in the logger API.
+### Logs
 
-`GET /metrics` exposes Prometheus-compatible counters and summaries. The
-registry records operation results, Inbox duplicates, consumer and reference
-retries/failures, outbox claims/publications/failures, reconciliation runs and
-divergences, plus HTTP request and outbox processing timing. Individual
-wallet, transaction, provider, message and correlation IDs are deliberately
-not metric labels, so series cardinality remains bounded.
+Every log line is one JSON object written by `observability.Logger`, with a UTC
+timestamp, level and event name. Fields pass through an allowlist, so tokens,
+`Authorization` headers, secrets, passwords, player IDs, amounts and complete
+payloads cannot be logged even by mistake. Errors are logged as `errorClass`,
+never as their message (which can contain hosts, user names or values):
+`timeout`, `canceled`, `postgres_<SQLSTATE>` (e.g. `postgres_40P01`),
+`postgres_connect`, `aws_<error code>`, `network`, or the type of the innermost
+error.
+
+Correlation: HTTP uses the incoming `Correlation-ID` header (a UUID is
+generated when absent and returned in the response). SQS uses the command's
+`messageId`. Every line of that request or command carries it as
+`correlationId`.
+
+| Event | Identifiers |
+| --- | --- |
+| `http_request` | `correlationId`, method, route, status, duration |
+| `wager_transaction_completed` / `wager_transaction_failed` (HTTP and SQS) | `correlationId`, `transactionId`, `walletId`, `providerId`, operation, status, `failureCode`, replay, duration |
+| `consumer_command_validated`, `consumer_financial_processing_completed`, `consumer_message_deleted`, `consumer_message_retry_scheduled`, `consumer_message_released` | `correlationId`, `messageId`, `walletId`, `providerId`, `transactionId` when known |
+| `outbox_event_claimed`, `outbox_event_published`, `outbox_publish_failed` | `eventId`, `aggregateId`, owner, attempt |
+| `reconciliation_divergence` | `walletId`, difference, currency, `checkedEntries` |
+| `readiness_check_failed`, `request_failed`, `authentication_failed` | dependency or route, reason |
+
+The domain events use the internal transaction ID as their `correlationId` (see
+"Integration event contract"). A request or command log line carries both its
+own `correlationId` and the `transactionId`, so requests, logs and events can be
+joined.
+
+### Metrics
+
+`GET /metrics` serves each process's registry in the Prometheus text format.
+Every replica has its own counters, so a scraper collects all replicas. The
+endpoint is public in Compose for convenience and should be restricted to the
+internal network in a real deployment. Label values come only from fixed sets
+(status, failure code, error kind, SQLSTATE, reason); identifiers are never
+labels.
+
+| Requirement | Metrics |
+| --- | --- |
+| Results by status | `wager_results_total{status}`, `wager_rejections_total{failure_code}`, `wager_errors_total{kind}` (`invalid_request`, `idempotency_conflict`, `external_transaction_conflict`, `wallet_not_found`, `infrastructure`), counted once for HTTP and SQS in `WageringService` |
+| Duplicates | `idempotency_replays_total` (both channels), `inbox_duplicates_total` (SQS redeliveries) |
+| Retries | `sqs_retries_total`, `sqs_messages_retried_total`, `outbox_retries_total`, `outbox_reschedules_total`, `reference_worker_failures_total` |
+| DLQ | `sqs_messages_dlq_eligible_total` (a delivery failed at the last allowed attempt, so the redrive will move it); `sqs_messages_released_total` |
+| Concurrency conflicts | `wallet_lock_wait_seconds` (time to acquire the wallet lock), `wallet_lock_contended_total` (waits of 5 ms or more, an approximation of "another writer held the wallet"), `db_concurrency_conflicts_total{sqlstate}` (deadlocks and serialization failures) |
+| Outbox delay | `outbox_lag_seconds` (commit to publication, per published event); gauges `outbox_pending_events` and `outbox_oldest_pending_seconds`, refreshed every publisher cycle, which keep growing when publication is stuck |
+| Processing latency | `wager_processing_duration_seconds` (both channels), `http_request_duration_seconds` |
+| Reconciliation | `reconciliation_total`, `reconciliation_divergences_total` |
+| Health and security | `readiness_check_failures_total`, `http_dependency_unavailable_total`, `auth_failures_total{reason}`, `http_requests_total` and status classes |
+
+Tests check the shape of the output, the labels and the Fx wiring:
+`TestHTTPServerExposesSharedMetrics` builds the real Fx graph and checks that
+`/metrics` serves the instance shared by services and workers. Constructors with
+variadic options are wrapped in the Fx module because Fx does not inject
+variadic parameters; that silently left the server with a private registry
+before. Tracing (OpenTelemetry) and dashboards are not implemented.
 
 ## Database migrations
 

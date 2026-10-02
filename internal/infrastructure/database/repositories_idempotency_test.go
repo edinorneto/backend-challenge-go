@@ -19,6 +19,7 @@ import (
 	"github.com/edinorneto/backend-challenge-go/internal/domain/wallet"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database"
 	"github.com/edinorneto/backend-challenge-go/internal/infrastructure/database/migrations"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 )
 
@@ -1357,5 +1358,42 @@ func TestProcessTransactionConcurrentBetsDoNotDeadlock(t *testing.T) {
 		if !(statuses[0] == "PROCESSED" && statuses[1] == "REJECTED") && !(statuses[0] == "REJECTED" && statuses[1] == "PROCESSED") {
 			t.Fatalf("round %d: expected one processed and one rejected bet, got %v", round, statuses)
 		}
+	}
+}
+
+// An operation that waits for another writer of its wallet is visible in the
+// wallet lock metrics; an uncontended one only adds to the wait summary.
+func TestProcessTransactionRecordsWalletLockContention(t *testing.T) {
+	pool := testPool(t)
+	metrics := observability.NewMetrics()
+	repo := database.NewWalletRepo(pool).WithMetrics(metrics)
+	playerID, walletID := createTestWallet(t, repo, pool, "100.00")
+
+	if _, err := repo.ProcessTransaction(context.Background(), testRequest(playerID, walletID, "lock-free", "lock-free-key", "lock-free-hash", testMoney(t, "1.00"))); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.Snapshot("wallet_lock_contended_total") != 0 {
+		t.Fatal("an uncontended lock must not count as contention")
+	}
+
+	holder, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Exec(context.Background(), `SELECT id FROM wallets WHERE id = $1 FOR NO KEY UPDATE`, walletID); err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		_ = holder.Rollback(context.Background())
+		close(released)
+	}()
+	if _, err := repo.ProcessTransaction(context.Background(), testRequest(playerID, walletID, "lock-contended", "lock-contended-key", "lock-contended-hash", testMoney(t, "1.00"))); err != nil {
+		t.Fatal(err)
+	}
+	<-released
+	if got := metrics.Snapshot("wallet_lock_contended_total"); got != 1 {
+		t.Fatalf("expected the waiting operation to be counted as contention, got %d", got)
 	}
 }

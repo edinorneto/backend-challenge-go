@@ -156,22 +156,17 @@ go test -tags=e2e -count=1 -v ./test/e2e/
 
 ## Observability
 
-The API emits one JSON log entry per HTTP request and structured JSON entries
-for consumer, outbox, and reference-worker transitions. Entries include UTC
-timestamps, level, event message, duration when applicable, and only the
-identifiers available to that flow (`correlationId`, `messageId`,
-`transactionId`, `walletId`, `providerId`, or `eventId`). The incoming
-`Correlation-ID` is preserved and returned; requests without one receive a
-generated value.
+Logs are JSON lines on stdout/stderr of each replica (`docker compose logs
+application`). Each HTTP request and SQS command is traceable by `correlationId`
+(the `Correlation-ID` header or the SQS `messageId`) together with
+`transactionId`, `walletId`, `providerId` and `messageId`. Tokens, secrets,
+player IDs, amounts and payloads are never logged.
 
-Authorization headers, JWTs, client secrets, AWS credentials, passwords,
-access tokens, and complete financial payloads are never logged.
-
-`GET /metrics` is a public Prometheus-compatible technical endpoint. Counters
-cover operation results, Inbox duplicates, retries, consumer failures, outbox
-claims/publications/failures, reconciliation executions and divergences.
-Request and outbox timing are exported as summaries. Metrics use fixed names
-without individual IDs as labels, preventing unbounded cardinality.
+`GET /metrics` exposes Prometheus metrics per replica: results by status,
+rejections by failure code, duplicates, retries, DLQ, wallet lock contention,
+outbox lag and backlog, processing latency, reconciliation divergences,
+readiness and authentication failures. `ARCHITECTURE.md` ("Observability")
+lists every log event and metric.
 
 ## Outbox publisher
 
