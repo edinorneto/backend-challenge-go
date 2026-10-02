@@ -38,12 +38,44 @@ reconciliation; `wagering-provider` (provider users) for submitting operations
 and provider lookups. Provider isolation is also enforced below HTTP:
 idempotency keys, external IDs and reference resolution are all scoped by
 `provider_id` in the unique indexes and queries, so replays and reversals never
-cross providers. The public `/health/live` endpoint reports process liveness. The public
-`/health/ready` endpoint checks PostgreSQL and SQS readiness, returning `200`
-with `{"status":"ready"}` when both are available and `503` with
-`{"status":"not_ready","checks":{"postgres":"ok|error","sqs":"ok|error"}}`
-when either dependency is unavailable. The application domain and
-`WageringService` do not depend on the OIDC library.
+cross providers. The application domain and `WageringService` do not depend on
+the OIDC library.
+
+### Health checks
+
+Both endpoints are public and accept only `GET`.
+
+- `/health/live` answers `200` while the process is running. It does not check
+  dependencies, so an outage of PostgreSQL or SQS does not make the orchestrator
+  restart instances that will recover by themselves.
+- `/health/ready` checks PostgreSQL (`Ping` on the pool) and SQS (resolving the
+  URLs of the command queue, the DLQ and the event queue, so a missing queue also
+  fails). It returns `200` with `{"status":"ready"}`, or `503` with
+  `{"status":"not_ready","checks":{"postgres":"ok|error","sqs":"ok|error"}}`.
+
+The two checks run concurrently, each with its own 3-second deadline, so a
+hanging dependency cannot make the other one look unavailable and the endpoint
+answers within about 3 seconds. Each failed check is logged as
+`readiness_check_failed` with `dependency` (`postgres`/`sqs`) and `reason`
+(`timeout`/`unavailable`), and it increments `readiness_check_failures_total`.
+The raw error is not logged because it may contain hosts or database user names.
+
+During a temporary outage the instances keep running. A request that fails
+because of a temporary database condition (unreachable server, dropped
+connection, timeout, deadlock, serialization failure or another retryable
+SQLSTATE, see `database.IsTransient`) answers `503`
+`{"error":"service_unavailable"}` with `Retry-After: 1`. Nothing was committed,
+so the client can retry with the same `Idempotency-Key`. Any other unexpected
+error stays `500` `{"error":"internal_error"}`. Both cases are logged as
+`request_failed` with the route, and 503s also increment
+`http_dependency_unavailable_total`. HTTP writes do not depend on SQS: events go
+through the outbox, so `POST /wagering/transactions` keeps working while SQS is
+down and the events are published after it returns. Meanwhile the SQS
+consumer, the outbox publisher and the reference worker log the failure and
+retry on their next cycle. This was verified by stopping and restarting the
+PostgreSQL and LocalStack containers under three instances: readiness switched
+to `503` for the affected dependency only, liveness stayed `200`, and HTTP, SQS
+consumption and outbox publication resumed without restarting the application.
 
 The publisher is implemented as a separate application worker. It claims a small
 batch of pending outbox rows using PostgreSQL `FOR UPDATE SKIP LOCKED`, checks

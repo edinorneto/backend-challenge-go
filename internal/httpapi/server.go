@@ -113,18 +113,28 @@ func (s *Server) readyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	postgresStatus := "ok"
-	if s.postgres == nil || s.postgres.Ping(ctx) != nil {
-		postgresStatus = "error"
-	}
-
-	sqsStatus := "ok"
-	if s.sqs == nil || s.sqs.Check(ctx) != nil {
-		sqsStatus = "error"
-	}
+	// Each dependency gets its own deadline and runs concurrently, so a hanging
+	// PostgreSQL cannot make SQS look unavailable (or the reverse).
+	postgresDone := make(chan string, 1)
+	sqsDone := make(chan string, 1)
+	go func() {
+		postgresDone <- s.checkDependency(r.Context(), "postgres", func(ctx context.Context) error {
+			if s.postgres == nil {
+				return errors.New("postgres health checker is not configured")
+			}
+			return s.postgres.Ping(ctx)
+		})
+	}()
+	go func() {
+		sqsDone <- s.checkDependency(r.Context(), "sqs", func(ctx context.Context) error {
+			if s.sqs == nil {
+				return errors.New("sqs health checker is not configured")
+			}
+			return s.sqs.Check(ctx)
+		})
+	}()
+	postgresStatus := <-postgresDone
+	sqsStatus := <-sqsDone
 
 	if postgresStatus == "error" || sqsStatus == "error" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
@@ -138,6 +148,31 @@ func (s *Server) readyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+var readinessCheckTimeout = 3 * time.Second
+
+// checkDependency runs one readiness check and logs the failed dependency with a
+// coarse reason. The raw error is not logged because it may contain hosts or
+// database user names.
+func (s *Server) checkDependency(parent context.Context, dependency string, check func(context.Context) error) string {
+	ctx, cancel := context.WithTimeout(parent, readinessCheckTimeout)
+	defer cancel()
+	err := check(ctx)
+	if err == nil {
+		return "ok"
+	}
+	reason := "unavailable"
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		reason = "timeout"
+	}
+	if s.logger != nil {
+		s.logger.Error(parent, "readiness_check_failed", err, map[string]string{"dependency": dependency, "reason": reason})
+	}
+	if s.metrics != nil {
+		s.metrics.Inc("readiness_check_failures_total")
+	}
+	return "error"
 }
 
 func (s *Server) walletsHandler(w http.ResponseWriter, r *http.Request) {
@@ -202,9 +237,7 @@ func (s *Server) walletsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error": "internal_error",
-		})
+		s.writeServerError(w, r, err)
 		return
 	}
 
@@ -313,7 +346,7 @@ func (s *Server) getWalletHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "wallet_not_found"})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		s.writeServerError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -348,7 +381,7 @@ func (s *Server) getLedgerHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_cursor"})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		s.writeServerError(w, r, err)
 		return
 	}
 	responseEntries := make([]map[string]any, 0, len(entries))
@@ -382,7 +415,7 @@ func (s *Server) reconciliationHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "wallet_not_found"})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		s.writeServerError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -412,7 +445,7 @@ func (s *Server) getTransactionHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "transaction_not_found"})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		s.writeServerError(w, r, err)
 		return
 	}
 	if !identity.HasRole(auth.RoleWalletInternal) && identity.ProviderID != transaction.ProviderID {
@@ -438,7 +471,7 @@ func (s *Server) getExternalTransactionHandler(w http.ResponseWriter, r *http.Re
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "transaction_not_found"})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		s.writeServerError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, transactionResponse(transaction))
@@ -597,9 +630,7 @@ func (s *Server) wageringHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error": "internal_error",
-		})
+		s.writeServerError(w, r, err)
 		return
 	}
 
@@ -627,4 +658,27 @@ func (s *Server) wageringHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, response)
+}
+
+// writeServerError answers an unexpected failure. A temporary database condition
+// becomes 503 service_unavailable with Retry-After, so clients can tell it apart
+// from a defect (500 internal_error) and retry with the same Idempotency-Key.
+func (s *Server) writeServerError(w http.ResponseWriter, r *http.Request, err error) {
+	transient := database.IsTransient(err)
+	result := "internal_error"
+	if transient {
+		result = "service_unavailable"
+	}
+	if s.logger != nil {
+		s.logger.Error(r.Context(), "request_failed", err, map[string]string{"route": r.Pattern, "result": result})
+	}
+	if transient {
+		if s.metrics != nil {
+			s.metrics.Inc("http_dependency_unavailable_total")
+		}
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service_unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
 }

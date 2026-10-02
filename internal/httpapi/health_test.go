@@ -1,14 +1,19 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/edinorneto/backend-challenge-go/internal/auth"
+	"github.com/edinorneto/backend-challenge-go/internal/observability"
 )
 
 type healthPostgres struct {
@@ -152,4 +157,84 @@ func equalJSON(left, right map[string]any) bool {
 	leftJSON, _ := json.Marshal(left)
 	rightJSON, _ := json.Marshal(right)
 	return string(leftJSON) == string(rightJSON)
+}
+
+type hangingPostgres struct{}
+
+func (hangingPostgres) Ping(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestHealthReadyIsolatesSlowDependencyAndLogsReason(t *testing.T) {
+	previousTimeout := readinessCheckTimeout
+	readinessCheckTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { readinessCheckTimeout = previousTimeout })
+
+	var output bytes.Buffer
+	previousOutput := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+
+	metrics := observability.NewMetrics()
+	server := &Server{
+		postgres: hangingPostgres{},
+		sqs:      healthSQS{},
+		auth:     &auth.Middleware{},
+		logger:   observability.NewLogger(),
+		metrics:  metrics,
+	}
+	request := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+	response := httptest.NewRecorder()
+	started := time.Now()
+	server.Handler().ServeHTTP(response, request)
+
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("readiness must be bounded by the per-dependency timeout, took %s", elapsed)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string]any{"status": "not_ready", "checks": map[string]any{"postgres": "error", "sqs": "ok"}}
+	if response.Code != http.StatusServiceUnavailable || !equalJSON(body, expected) {
+		t.Fatalf("a hanging PostgreSQL must not mark SQS as failed: %d %#v", response.Code, body)
+	}
+	logs := output.String()
+	if !strings.Contains(logs, `"message":"readiness_check_failed"`) ||
+		!strings.Contains(logs, `"dependency":"postgres"`) ||
+		!strings.Contains(logs, `"reason":"timeout"`) {
+		t.Fatalf("expected a readiness failure log with dependency and reason, got %s", logs)
+	}
+	if strings.Contains(logs, `"dependency":"sqs"`) {
+		t.Fatalf("healthy SQS must not be logged as failed: %s", logs)
+	}
+	if got := metrics.Snapshot("readiness_check_failures_total"); got != 1 {
+		t.Fatalf("expected one readiness failure metric, got %d", got)
+	}
+}
+
+func TestHealthReadyLogsUnavailableDependencyWithoutRawError(t *testing.T) {
+	var output bytes.Buffer
+	previousOutput := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+
+	server := &Server{
+		postgres: healthPostgres{},
+		sqs:      healthSQS{err: errors.New("dial tcp localstack:4566 secret-detail")},
+		auth:     &auth.Middleware{},
+		logger:   observability.NewLogger(),
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+
+	logs := output.String()
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(logs, `"dependency":"sqs"`) || !strings.Contains(logs, `"reason":"unavailable"`) {
+		t.Fatalf("expected an unavailable SQS log, got %d %s", response.Code, logs)
+	}
+	if strings.Contains(logs, "secret-detail") {
+		t.Fatalf("readiness log leaked the raw dependency error: %s", logs)
+	}
 }
