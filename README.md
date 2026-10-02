@@ -147,7 +147,7 @@ They cover:
 - a restart of every replica.
 
 They use the `docker` CLI to stop replicas and restore the stack at the end, and
-take about 80 seconds, mostly the SQS visibility timeout after a SIGKILL:
+take under a minute, mostly the SQS visibility timeout after a SIGKILL:
 
 ```powershell
 docker compose up -d --build --wait

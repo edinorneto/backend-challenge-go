@@ -58,7 +58,8 @@ func safeField(key string) bool {
 	case "correlationId", "messageId", "transactionId", "walletId", "providerId",
 		"method", "route", "status", "duration", "errorClass",
 		"eventId", "aggregateId", "attempt", "owner", "lease", "lag",
-		"result", "operation", "groupId", "dependency", "reason":
+		"result", "operation", "groupId", "dependency", "reason",
+		"difference", "currency", "checkedEntries":
 		return true
 	default:
 		return false

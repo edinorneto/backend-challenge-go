@@ -397,7 +397,11 @@ func (r *WalletRepo) GetLedger(ctx context.Context, walletID uuid.UUID, cursor s
 }
 
 func (r *WalletRepo) Reconcile(ctx context.Context, walletID uuid.UUID) (ports.ReconciliationView, error) {
-	tx, err := r.DB.BeginTx(ctx, pgx.TxOptions{})
+	// Balance and ledger are read in two statements, so they need one snapshot:
+	// under READ COMMITTED an operation committing between them made healthy
+	// wallets look divergent. A read-only REPEATABLE READ transaction never
+	// fails with serialization errors and cannot modify anything.
+	tx, err := r.DB.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return ports.ReconciliationView{}, fmt.Errorf("begin reconciliation: %w", err)
 	}

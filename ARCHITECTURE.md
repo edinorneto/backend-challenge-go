@@ -277,9 +277,33 @@ deleted from SQS only after the Inbox, financial state and Outbox changes have
 committed.
 
 Wallet ledger reads use keyset pagination ordered by `(created_at, id)` and do
-not use SQL offsets. Reconciliation runs in a read transaction, sums credits
-and debits including the opening entry, reports the difference from the stored
-wallet balance, and never mutates the wallet or ledger.
+not use SQL offsets.
+
+### Reconciliation
+
+`POST /wallets/{walletId}/reconciliation` (role `wallet-internal`) rebuilds the
+balance from the ledger (credits minus debits, including the `OPENING` credit),
+compares it with the stored balance and returns `storedBalance`,
+`calculatedBalance`, `difference` (stored minus calculated), `consistent` and
+`checkedEntries`.
+
+The stored balance and the ledger are read in a `REPEATABLE READ`, `READ ONLY`
+transaction, so both come from one snapshot. The first version used the default
+`READ COMMITTED`, where each statement sees its own snapshot. Under concurrent
+bets, 25 of 300 reconciliations of a healthy wallet reported a false divergence
+(an operation committed between the two reads).
+`TestReconcileUsesOneSnapshotUnderConcurrentWrites` reproduces that, and passes
+with the single snapshot. A read-only transaction at this level never fails with
+serialization errors, and `READ ONLY` guarantees in the database that
+reconciliation changes nothing.
+
+A divergence is reported in three places: the response (`consistent: false` and
+the difference); an error log `reconciliation_divergence` with `walletId`,
+`difference`, `currency` and `checkedEntries`; and the counter
+`reconciliation_divergences_total`, next to `reconciliation_total`. The wallet is
+never repaired automatically. There is no correction endpoint; because the
+ledger is append-only, a correction would have to be a new ledger entry. Metrics are per process: each replica serves
+its own `/metrics`, and a scraper collects all replicas.
 
 ### Concurrency and wallet locking
 

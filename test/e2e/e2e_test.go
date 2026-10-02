@@ -244,44 +244,60 @@ func TestE2EInstanceFailuresDuringSQSLoad(t *testing.T) {
 	}
 
 	sent := make([]int, walletsCount)
+	// Four producers keep every replica busy. Each owns two wallets and sends at
+	// most 250 bets of 0.10, so no wallet can be overdrawn.
+	const producers = 4
 	stopProducing := make(chan struct{})
-	produced := make(chan struct{})
-	go func() {
-		defer close(produced)
-		for n := 0; n < 900; n++ { // 0.10 each: at most 112 per wallet, never overdrawn
-			select {
-			case <-stopProducing:
-				return
-			default:
+	var production sync.WaitGroup
+	for p := 0; p < producers; p++ {
+		production.Add(1)
+		go func(p int) {
+			defer production.Done()
+			for n := 0; n < 250; n++ {
+				select {
+				case <-stopProducing:
+					return
+				default:
+				}
+				i := p + (n%2)*producers
+				id := fmt.Sprintf("%s%d-%d", prefix, i, sent[i])
+				body := s.bet(wallets[i].player, wallets[i].wallet, id, "0.10")
+				s.sendCommand(id, providerID+":"+body.ExternalTransactionID, body)
+				sent[i]++
 			}
-			i := n % walletsCount
-			id := fmt.Sprintf("%s%d-%d", prefix, i, sent[i])
-			body := s.bet(wallets[i].player, wallets[i].wallet, id, "0.10")
-			s.sendCommand(id, providerID+":"+body.ExternalTransactionID, body)
-			sent[i]++
-		}
-	}()
+		}(p)
+	}
 
-	victim, stopped := containers[0], containers[1]
+	// Freeze replicas in turn until one is caught holding a received message it
+	// has not deleted; that one is the victim.
 	s.waitForCompleted(prefix, 50)
-	caught := 0
-	for attempt := 0; attempt < 40 && caught == 0; attempt++ {
-		docker(t, "pause", victim)
-		if caught = receivedButNotDeleted(t, victim, prefix); caught == 0 {
-			docker(t, "unpause", victim)
-			time.Sleep(30 * time.Millisecond)
+	var victim string
+	for attempt := 0; attempt < 200 && victim == ""; attempt++ {
+		candidate := containers[attempt%len(containers)]
+		docker(t, "pause", candidate)
+		if receivedButNotDeleted(t, candidate, prefix) > 0 {
+			victim = candidate
+		} else {
+			docker(t, "unpause", candidate)
 		}
 	}
-	if caught == 0 {
-		t.Fatal("could not freeze the victim while it held an undeleted message")
+	if victim == "" {
+		t.Fatal("could not freeze a replica while it held an undeleted message")
 	}
+	var others []string
+	for _, container := range containers {
+		if container != victim {
+			others = append(others, container)
+		}
+	}
+	stopped := others[0]
 	docker(t, "kill", "--signal", "KILL", victim)
 	interrupted := undeletedIDs(t, victim, prefix)
 
 	s.waitForCompleted(prefix, 300)
 	docker(t, "stop", "--time", "10", stopped)
 	close(stopProducing)
-	<-produced
+	production.Wait()
 
 	total := 0
 	for _, n := range sent {
@@ -298,7 +314,7 @@ func TestE2EInstanceFailuresDuringSQSLoad(t *testing.T) {
 	}
 	afterCommit := 0
 	for _, id := range interrupted {
-		if redeliveredAsDuplicate(t, containers[1:], id) {
+		if redeliveredAsDuplicate(t, others, id) {
 			afterCommit++
 		}
 	}

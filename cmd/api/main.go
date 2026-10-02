@@ -16,6 +16,7 @@ import (
 	"github.com/edinorneto/backend-challenge-go/internal/observability"
 	"github.com/edinorneto/backend-challenge-go/internal/ports"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 )
 
@@ -60,8 +61,8 @@ func AppOptions() fx.Option {
 			func(publisher *sqs.Publisher) ports.OutboxMessagePublisher {
 				return publisher
 			},
-			func(repo ports.WalletRepository, metrics *observability.Metrics) *application.WalletService {
-				return application.NewWalletService(repo, metrics)
+			func(repo ports.WalletRepository, logger *observability.Logger, metrics *observability.Metrics) *application.WalletService {
+				return application.NewWalletService(repo, logger, metrics)
 			},
 			application.NewWageringService,
 			func(repo ports.OutboxRepository, publisher ports.OutboxMessagePublisher, cfg config.Config, logger *observability.Logger, metrics *observability.Metrics) *application.OutboxPublisher {
@@ -81,7 +82,12 @@ func AppOptions() fx.Option {
 					MaxReceiveCount:       cfg.MaxReceiveCount,
 				}, logger, metrics)
 			},
-			httpapi.NewServer,
+			// NewServer takes its logger and metrics as variadic options, which Fx does
+			// not inject. Passing them explicitly makes /metrics expose the counters
+			// shared by every service and worker, not a private instance.
+			func(wallets *application.WalletService, wagering *application.WageringService, middleware *auth.Middleware, pool *pgxpool.Pool, queues *sqs.QueueManager, logger *observability.Logger, metrics *observability.Metrics) *httpapi.Server {
+				return httpapi.NewServer(wallets, wagering, middleware, pool, queues, logger, metrics)
+			},
 		),
 		fx.Invoke(
 			func(_ *migrations.Runner) {},
