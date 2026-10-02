@@ -165,7 +165,7 @@ deduplication):
 | One processed reversal per reference and kind | `uq_wager_processed_reversal_reference_kind` |
 | One processed reversal per reference, any kind | `uq_wager_processed_reversal_reference` (migration `000006`) |
 | One ledger entry per wallet and transaction | `uq_ledger_wallet_transaction` |
-| Append-only ledger | triggers reject every `UPDATE` and `DELETE` on `wallet_ledger_entries` |
+| Append-only ledger | triggers reject every `UPDATE` and `DELETE` (row level) and every `TRUNCATE` (statement level, migration `000007`) on `wallet_ledger_entries` |
 | Immutable outbox snapshot | trigger rejects updates of the event columns (`000004`) |
 | Internal vs external operations | `chk_wager_source`, `chk_wager_opening_internal`, `chk_wager_external_non_opening`, `chk_wager_reversal_reference` |
 | Kinds, statuses, amounts, currency format | `CHECK` constraints |
@@ -696,6 +696,17 @@ apply again, and the data is kept and the later protections come back.
   The consumer trusts `data.providerId` as coming from an authenticated producer:
   the SQS channel is internal and trusted, and binding the provider to the
   sender is the production evolution described in section 10.
+- **Ledger and privileged database roles.** The triggers stop `UPDATE`,
+  `DELETE` and `TRUNCATE` from any client, but a superuser or the table owner
+  can still disable or drop them. The application connects as `postgres`
+  because every replica applies the migrations at startup, and applying them
+  needs the owner's privileges. A separate runtime role without superuser and
+  with `REVOKE UPDATE, DELETE, TRUNCATE ON wallet_ledger_entries` would protect
+  little while the same process also holds the owner's credentials. Doing it
+  properly means moving migrations out of the replicas' startup: a one-shot job
+  (`cmd/migrate`) connects as the owner, and the replicas connect as a role
+  with `SELECT, INSERT` on the ledger and no DDL. That was not done here, so
+  that `docker compose up` keeps applying the schema from any replica.
 - **`WIN` reference.** A `WIN` may carry `referenceExternalTransactionId` (the
   challenge makes it optional). It is stored and returned in reads and events,
   but it is not resolved or validated against a bet; only `REFUND` and

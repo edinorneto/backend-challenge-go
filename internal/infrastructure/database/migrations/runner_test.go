@@ -129,6 +129,7 @@ func TestRunnerDownRevertsLatestMigrations(t *testing.T) {
 		assertMigrationCount(t, pool, int(version-1))
 	}
 	assertExists(t, pool, `SELECT to_regclass('uq_wager_processed_reversal_reference') IS NOT NULL`, false, "one reversal per reference index")
+	assertExists(t, pool, `SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_prevent_ledger_truncate' AND tgrelid = to_regclass('wallet_ledger_entries'))`, false, "ledger TRUNCATE trigger")
 	latest = min(latest, 5)
 
 	if err := runner.Down(ctx, 1); err != nil {
