@@ -487,6 +487,37 @@ wallet's player and currency, reference matching, idempotency). LocalStack
 Community stores the policies but does not enforce IAM, so the denial itself is
 not exercised locally (section 16).
 
+**Provider identity on SQS.** HTTP derives the provider from the token. On SQS
+the message carries `data.providerId`, and the consumer does not bind it to the
+sender: the command queue is treated as an **internal, trusted channel**. Who
+may publish is decided by the broker, as section 2 of the challenge asks:
+credentials plus the queue policy, which lets only the producer role send and
+never read. Any authenticated producer can therefore send a command for any
+provider. That is acceptable only while the producer role belongs to a trusted
+integration layer, not to the providers themselves.
+
+Binding by the `SenderId` system attribute was evaluated and not adopted.
+LocalStack fills `SenderId` with the account derived from the access key, which
+it does not verify: two producers with different credentials in the same account
+get the same `SenderId`, and any caller can pick any key.
+`TestLocalStackSenderIdDoesNotIdentifyTheProducer` records this. A check built
+on it would pass the tests here without proving anything.
+
+Evolution for production, in order of preference:
+
+1. **One queue per provider.** Each queue's policy allows `SendMessage` only to
+   that provider's IAM role, and the consumer takes the provider from the queue
+   it read, not from the body. A divergent `data.providerId` goes to the DLQ
+   without any effect.
+2. **Shared queue with `SenderId`.** On AWS, `SenderId` is the caller's IAM
+   principal (the role ID for an assumed role, `AROA...:session`). A
+   configuration table maps each role ID to its `providerId`; the consumer
+   requests the attribute (`MessageSystemAttributeNames: SenderId`) and sends a
+   mismatch or an unknown sender to the DLQ, counted as `invalid_message`.
+
+Either way the domain validations stay as they are (wallet player and currency,
+reference matching, idempotency scoped by provider).
+
 ## 11. Health, failures and multiple instances
 
 **Health checks.** Both are public and accept only `GET`.
@@ -662,7 +693,9 @@ apply again, and the data is kept and the later protections come back.
 - **Broker policies** are defined, versioned and applied to the queues (section
   10), but LocalStack Community does not enforce IAM. A request from a principal
   outside the policy is therefore not actually denied locally; on AWS it would be.
-  The consumer trusts `data.providerId` as coming from an authenticated producer.
+  The consumer trusts `data.providerId` as coming from an authenticated producer:
+  the SQS channel is internal and trusted, and binding the provider to the
+  sender is the production evolution described in section 10.
 - **`WIN` reference.** A `WIN` may carry `referenceExternalTransactionId` (the
   challenge makes it optional). It is stored and returned in reads and events,
   but it is not resolved or validated against a bet; only `REFUND` and
