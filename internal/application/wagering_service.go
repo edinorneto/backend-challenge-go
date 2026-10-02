@@ -91,6 +91,12 @@ func (s *WageringService) process(
 		strings.TrimSpace(req.ReferenceExternalTransactionID) == "" {
 		return ports.ProcessTransactionResult{}, ErrInvalidWagerRequest
 	}
+	// Amount policy per kind: LOSS is exactly zero, every other kind is
+	// positive. Checked here so both channels refuse it as invalid input
+	// (400 / invalid message) before anything is stored.
+	if req.Amount.IsNegative() || (kind == "LOSS") != req.Amount.IsZero() {
+		return ports.ProcessTransactionResult{}, ErrInvalidWagerRequest
+	}
 
 	payloadHash, err := computePayloadHash(
 		req.ProviderID,
