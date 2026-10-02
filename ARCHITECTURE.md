@@ -445,7 +445,10 @@ challenge recommends, it is a standard OIDC provider, and the realm import makes
 the environment reproducible. Providers use the `password` grant of the
 `backend-api` client (test users only). The internal service uses
 `client_credentials` on the confidential `backend-internal` client. The API
-never stores passwords or issues tokens.
+never stores passwords or issues tokens. The test-only client
+`backend-api-short-lived` issues the same provider tokens with a 2 s lifespan,
+so `TestKeycloakExpiredTokenIsRejected` checks expiry against a real Keycloak
+token; like the test users, it does not belong in a production realm.
 
 **Validation** (`internal/auth`, `go-oidc`). Every protected route requires a
 Bearer JWT. The API checks the RS256 signature against the realm JWKS (fetched
